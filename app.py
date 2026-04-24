@@ -1254,9 +1254,11 @@ def get_market_state(token: str = "") -> dict:
 
 def scan_sector(sector: str, token: str, taiex_df: pd.DataFrame,
                 start: str, end: str, max_per_sector: int,
-                market_data: dict, sector_stats: dict) -> list[dict]:
+                market_data: dict, sector_stats: dict,
+                scan_mode: str = "mid") -> list[dict]:
     stocks  = SECTOR_STOCKS.get(sector, [])[:max_per_sector]
     results = []
+    mode_label = {"short":"短線 7日","mid":"中線 6-12月","long":"長線 1年+"}[scan_mode]
 
     for sid in stocks:
         df = fetch_price(sid, start, end, token)
@@ -1267,14 +1269,15 @@ def scan_sector(sector: str, token: str, taiex_df: pd.DataFrame,
         rev_df  = fetch_monthly_revenue(sid, token)
         sec_st  = sector_stats.get(sector, {"avg_chg":0,"strong_count":0,"vol_rank":99})
 
-        gps     = score_gps(df, market_data, sec_st, rev_df, sid)
+        gps   = score_gps(df, market_data, sec_st, rev_df, sid)
 
-        # 跳過 C 級（< 50），減少 API 消耗
-        if gps["score"] < 50:
-            time.sleep(0.2); continue
+        # 低分跳過（門檻依模式調整）
+        min_threshold = {"short": 45, "mid": 45, "long": 40}[scan_mode]
+        if gps["score"] < min_threshold:
+            time.sleep(0.15); continue
 
-        bt    = quick_backtest(df, "mid")
-        zones = compute_trade_zones(df, "short")
+        bt    = quick_backtest(df, scan_mode)
+        zones = compute_trade_zones(df, scan_mode)
         last  = df.iloc[-1]
         prev  = df.iloc[-2] if len(df) >= 2 else last
         chg   = (float(last["Close"]) - float(prev["Close"])) / float(prev["Close"]) * 100
@@ -1283,6 +1286,7 @@ def scan_sector(sector: str, token: str, taiex_df: pd.DataFrame,
             "代號":       sid,
             "名稱":       STOCK_NAMES.get(sid, sid),
             "產業":       sector,
+            "模式":       mode_label,
             "收盤價":     round(float(last["Close"]), 1),
             "漲跌%":      round(chg, 2),
             "信號":       "✅ 買進" if gps["signal"] else "⬜ 觀察",
@@ -1300,7 +1304,7 @@ def scan_sector(sector: str, token: str, taiex_df: pd.DataFrame,
             "回測報酬%":  bt["return"],
             "勝率%":      bt["win_rate"],
             "MDD%":       bt["mdd"],
-            "_mode":      "mid",
+            "_mode":      scan_mode,
             "_zones":     zones,
             "_gps":       gps,
         })
@@ -1310,28 +1314,29 @@ def scan_sector(sector: str, token: str, taiex_df: pd.DataFrame,
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def run_full_scan(sectors: list, token: str, max_per_sector: int) -> pd.DataFrame:
+def run_full_scan(sectors: list, token: str, max_per_sector: int,
+                  scan_mode: str = "mid") -> pd.DataFrame:
     end   = datetime.today().strftime("%Y-%m-%d")
     start = (datetime.today() - timedelta(days=380)).strftime("%Y-%m-%d")
 
     taiex_df    = fetch_taiex(start, end, token)
-    market_data = get_market_state(token)   # GPS Stage 1 資料
+    market_data = get_market_state(token)
 
     prog = st.progress(0.0)
     stat = st.empty()
 
-    # ── Phase 1：輕量預掃描（取得族群動能資料）──────────────
+    # ── Phase 1：輕量預掃描（族群動能）──────────────────────
     stat.markdown(
-        "<span style='color:#4a8aaa;font-size:0.8rem;'>⚡ 預掃描族群動能（Phase 1）…</span>",
+        "<span style='color:#4a8aaa;font-size:0.8rem;'>⚡ 預掃描族群動能…</span>",
         unsafe_allow_html=True
     )
-    sector_raw: dict[str, list] = {}   # {sector: [(chg%, vol)]}
+    sector_raw: dict[str, list] = {}
     pre_start = (datetime.today() - timedelta(days=10)).strftime("%Y-%m-%d")
 
     for i, sector in enumerate(sectors):
-        prog.progress((i + 1) / len(sectors) * 0.3)   # 前 30% 進度給預掃描
+        prog.progress((i + 1) / len(sectors) * 0.3)
         chgs_vols = []
-        for sid in SECTOR_STOCKS.get(sector, [])[:4]:  # 每產業取 4 檔代表
+        for sid in SECTOR_STOCKS.get(sector, [])[:4]:
             try:
                 df_tmp = fetch_price(sid, pre_start, end, token)
                 if df_tmp.empty or len(df_tmp) < 2: continue
@@ -1346,17 +1351,17 @@ def run_full_scan(sectors: list, token: str, max_per_sector: int) -> pd.DataFram
 
     sector_stats = compute_sector_stats(sector_raw)
 
-    # ── Phase 2：完整個股 GPS 評分 ────────────────────────────
+    # ── Phase 2：GPS 評分 ────────────────────────────────────
     all_results = []
     for i, sector in enumerate(sectors):
         stat.markdown(
-            f"<span style='color:#4a8aaa;font-size:0.8rem;'>📊 GPS 評分 {sector} 產業…"
+            f"<span style='color:#4a8aaa;font-size:0.8rem;'>📊 {sector}…"
             f"（{i+1}/{len(sectors)}）</span>",
             unsafe_allow_html=True
         )
         prog.progress(0.3 + (i + 1) / len(sectors) * 0.7)
         rows = scan_sector(sector, token, taiex_df, start, end,
-                           max_per_sector, market_data, sector_stats)
+                           max_per_sector, market_data, sector_stats, scan_mode)
         all_results.extend(rows)
 
     prog.empty(); stat.empty()
@@ -1365,7 +1370,7 @@ def run_full_scan(sectors: list, token: str, max_per_sector: int) -> pd.DataFram
         return pd.DataFrame()
 
     df = pd.DataFrame(all_results)
-    df = df.sort_values(["評分"], ascending=False).reset_index(drop=True)
+    df = df.sort_values("評分", ascending=False).reset_index(drop=True)
     return df
 
 
@@ -1752,6 +1757,56 @@ def main():
                               help="[免費申請](https://finmindtrade.com/)")
 
         st.divider()
+        st.markdown("**🎯 選股模式**")
+
+        scan_mode = st.radio(
+            "選擇你的投資週期",
+            options=["short", "mid", "long"],
+            format_func=lambda x: {
+                "short": "⚡ 短線（7日內）",
+                "mid":   "📊 中線（6-12個月）",
+                "long":  "🔭 長線（1年以上）",
+            }[x],
+            index=1,
+            help="不同週期使用不同專家方法論與評分邏輯",
+        )
+
+        # 對應專家說明
+        expert_map = {
+            "short": [
+                ("Mark Minervini", "VCP 壓縮突破、RS 相對強度"),
+                ("Larry Williams", "波動率突破、威廉%R"),
+                ("Dan Zanger",     "杯狀帶柄、爆量確認"),
+            ],
+            "mid": [
+                ("William O'Neil", "CANSLIM 成長選股"),
+                ("蔣承翰 / Mgk",   "族群動能、籌碼追蹤"),
+                ("Stan Weinstein", "Stage 2 趨勢分析"),
+            ],
+            "long": [
+                ("Warren Buffett", "護城河、ROE 品質"),
+                ("Cathie Wood",    "破壞式創新、成長估值"),
+                ("科斯托蘭尼",      "大週期判斷、耐心持有"),
+            ],
+        }
+        expert_color = {"short":"#f0c040","mid":"#4ab3ff","long":"#00c87a"}
+        ec = expert_color[scan_mode]
+        expert_html = "".join([
+            f'<div style="display:flex;justify-content:space-between;padding:3px 0;'
+            f'border-bottom:1px solid #0e2030;font-size:0.71rem;">'
+            f'<span style="color:{ec};font-weight:600;">{n}</span>'
+            f'<span style="color:#4a6a80;">{m}</span></div>'
+            for n, m in expert_map[scan_mode]
+        ])
+        st.markdown(
+            f'<div style="background:#060f1c;border:1px solid #1a3050;border-radius:8px;'
+            f'padding:10px 12px;margin:6px 0;">'
+            f'<div style="font-size:0.65rem;color:#2a6a8a;letter-spacing:0.1em;margin-bottom:6px;">'
+            f'參考專家</div>{expert_html}</div>',
+            unsafe_allow_html=True
+        )
+
+        st.divider()
         st.markdown("**📡 掃描設定**")
 
         all_sectors = list(SECTOR_STOCKS.keys())
@@ -1782,17 +1837,11 @@ def main():
         clr_btn = col2.button("🗑️ 清快取", use_container_width=True)
         if clr_btn:
             st.cache_data.clear()
+            st.session_state.pop("scan_df", None)
+            st.session_state.pop("scan_mode_used", None)
             st.success("快取已清除")
 
         st.divider()
-        st.markdown(
-            '<div style="font-size:0.72rem;color:#3a5a70;line-height:1.6;">'
-            '<span class="method-tag">Weinstein</span> 長線趨勢<br>'
-            '<span class="method-tag">CANSLIM</span> 中線動能<br>'
-            '<span class="method-tag">Williams</span> 短線爆發<br>'
-            '<span class="method-tag">ATR×Fib</span> 價位計算<br>'
-            '</div>', unsafe_allow_html=True
-        )
         st.caption("⚠️ 僅供研究，不構成投資建議")
 
     # ── Header ───────────────────────────────────────────────
@@ -1852,115 +1901,147 @@ def main():
     with tab_scan:
         if "scan_df" not in st.session_state:
             st.session_state["scan_df"] = None
+            st.session_state["scan_mode_used"] = None
 
         if run_btn:
             if not sel_sectors:
                 st.warning("請至少勾選一個產業")
             else:
                 with st.spinner("掃描中，請稍候…"):
-                    st.session_state["scan_df"] = run_full_scan(
-                        sel_sectors, token, max_per
+                    st.session_state["scan_df"]        = run_full_scan(
+                        sel_sectors, token, max_per, scan_mode
                     )
+                    st.session_state["scan_mode_used"] = scan_mode
 
-        scan_df = st.session_state.get("scan_df")
+        scan_df   = st.session_state.get("scan_df")
+        mode_used = st.session_state.get("scan_mode_used", scan_mode)
+        mode_lbl  = {"short":"⚡ 短線 7日","mid":"📊 中線 6-12月","long":"🔭 長線 1年+"}[mode_used]
 
         if scan_df is None:
-            st.info("👈 點左側「🔍 開始掃描」啟動全市場篩選")
+            st.info("👈 左側選擇投資週期後，點「🔍 開始掃描」啟動篩選")
             return
 
         if scan_df.empty:
-            st.error("掃描結果為空，請確認 API Token 或網路連線")
+            st.markdown(
+                '<div class="warn-bar">掃描結果為空。可能原因：<br>'
+                '① GPS 門檻目前無符合股票（市場偏弱）<br>'
+                '② API Token 未生效（請確認 token 已填入）<br>'
+                '③ 請點「清快取」後重新掃描</div>',
+                unsafe_allow_html=True
+            )
             return
 
-        # 篩選器
-        f1, f2, f3, f4 = st.columns([2, 2, 1.5, 1.5])
+        # ── 篩選器（移除持有週期，改用評級）────────────────
+        f1, f2, f3 = st.columns([2, 2, 2])
         with f1:
-            period_filter = st.multiselect("持有週期",
-                ["短線 7日","中線 6-12月","長線 1年+"],
-                default=["短線 7日","中線 6-12月","長線 1年+"])
+            grade_filter = st.multiselect(
+                "GPS 評級篩選",
+                options=["AAA","AA","B"],
+                default=["AAA","AA","B"],
+            )
         with f2:
-            sector_filter = st.multiselect("產業",
+            sector_filter = st.multiselect(
+                "產業",
                 options=sorted(scan_df["產業"].unique().tolist()),
-                default=[])
+                default=[],
+            )
         with f3:
-            buy_only = st.checkbox("只看買進信號", value=True)
-        with f4:
-            min_score = st.slider("最低評分", 0, 100, 50, 5)
+            buy_only  = st.checkbox("只看買進信號", value=True)
 
         view = scan_df.copy()
-        if period_filter:
-            view = view[view["持有週期"].isin(period_filter)]
+        if grade_filter:
+            view = view[view["評級"].isin(grade_filter)]
         if sector_filter:
             view = view[view["產業"].isin(sector_filter)]
         if buy_only:
             view = view[view["信號"] == "✅ 買進"]
-        view = view[view["評分"] >= min_score]
 
-        # 今日精選置頂（買進信號，依評分前 5 名，每排 3 欄）
-        st.markdown('<div class="sec-title">今日最佳標的 Top 5</div>', unsafe_allow_html=True)
+        # ── 今日最佳 Top 5 ──────────────────────────────────
+        st.markdown(
+            f'<div class="sec-title">今日最佳標的 Top 5 &nbsp;'
+            f'<span style="font-size:0.75rem;color:#3a6a8a;">模式：{mode_lbl}</span></div>',
+            unsafe_allow_html=True
+        )
 
         top_cards = (view[view["信號"] == "✅ 買進"]
                      .sort_values("評分", ascending=False)
                      .head(5))
 
         if top_cards.empty:
-            st.markdown('<div class="warn-bar">目前無任何買進信號，市場偏弱，建議持盈保泰。</div>',
-                        unsafe_allow_html=True)
+            st.markdown(
+                '<div class="warn-bar">目前無買進信號。市場可能偏弱，或 GPS 篩選門檻較嚴，'
+                '可嘗試取消「只看買進信號」查看觀察清單。</div>',
+                unsafe_allow_html=True
+            )
         else:
-            # 每排最多 3 欄，5 檔分兩排（3+2）
-            rows_of_cards = [top_cards.iloc[:3], top_cards.iloc[3:]]
-            for card_row in rows_of_cards:
-                if card_row.empty:
-                    continue
-                tcols = st.columns(len(card_row))
-                for i, (_, row) in enumerate(card_row.iterrows()):
-                    tcols[i].markdown(render_card(row), unsafe_allow_html=True)
+            for chunk in [top_cards.iloc[:3], top_cards.iloc[3:]]:
+                if chunk.empty: continue
+                cols = st.columns(len(chunk))
+                for i, (_, row) in enumerate(chunk.iterrows()):
+                    cols[i].markdown(render_card(row), unsafe_allow_html=True)
 
-        # 完整排行榜
+        # ── 完整排行榜 ────────────────────────────────────────
         st.markdown(f'<div class="sec-title">完整排行榜（{len(view)} 筆）</div>',
                     unsafe_allow_html=True)
 
-        disp_cols = ["代號","名稱","產業","持有週期","收盤價","漲跌%","信號",
-                     "評分","回測報酬%","勝率%","MDD%"]
+        disp_cols = ["代號","名稱","產業","模式","收盤價","漲跌%","信號",
+                     "評分","評級","G分","P分","S分","F分","回測報酬%","勝率%","MDD%"]
         disp = view[[c for c in disp_cols if c in view.columns]].copy()
 
         def _cn(v): return "color:#00c87a" if isinstance(v,(int,float)) and v>0 else ("color:#ff5c5c" if isinstance(v,(int,float)) and v<0 else "")
         def _cs(v): return f"color:{score_color(v)};font-weight:bold" if isinstance(v,(int,float)) else ""
 
         styled = (disp.style
-                  .map(_cn, subset=["漲跌%","回測報酬%"])
-                  .map(_cs, subset=["評分"])
-                  .map(lambda v: "color:#ff5c5c", subset=["MDD%"])
-                  .format({"收盤價":"{:.1f}","漲跌%":"{:+.2f}%","評分":"{:.0f}",
-                           "回測報酬%":"{:+.1f}%","勝率%":"{:.1f}%","MDD%":"{:.1f}%"})
+                  .map(_cn, subset=[c for c in ["漲跌%","回測報酬%"] if c in disp.columns])
+                  .map(_cs, subset=[c for c in ["評分"] if c in disp.columns])
+                  .map(lambda v: "color:#ff5c5c", subset=[c for c in ["MDD%"] if c in disp.columns])
+                  .format({k:v for k,v in {
+                      "收盤價":"{:.1f}","漲跌%":"{:+.2f}%","評分":"{:.0f}",
+                      "回測報酬%":"{:+.1f}%","勝率%":"{:.1f}%","MDD%":"{:.1f}%",
+                      "G分":"{:.0f}","P分":"{:.0f}","S分":"{:.0f}","F分":"{:.0f}",
+                  }.items() if k in disp.columns})
                   .set_properties(**{"font-size":"0.83rem"}))
 
         st.dataframe(styled, use_container_width=True, height=440, hide_index=True)
 
         csv = disp.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
         st.download_button("⬇️ 匯出 CSV", csv,
-                           f"scan_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                           f"gps_{mode_used}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                            "text/csv")
 
-        # K 線圖
+        # ── K 線圖（修正 KeyError：不再使用持有週期欄位）───────
         st.markdown('<div class="sec-title">個股 K 線圖</div>', unsafe_allow_html=True)
-        ticker_opts = [f"{r['代號']} {r['名稱']} ({r['持有週期']})" for _, r in view.iterrows()]
 
-        if ticker_opts:
-            sel_opt = st.selectbox("選擇股票", ticker_opts, index=0)
-            sel_id  = sel_opt.split()[0]
-            sel_name= STOCK_NAMES.get(sel_id, sel_id)
-            end_dt  = datetime.today().strftime("%Y-%m-%d")
-            start_dt= (datetime.today() - timedelta(days=380)).strftime("%Y-%m-%d")
-            with st.spinner(f"載入 {sel_id}…"):
+        all_view = scan_df.copy()   # 用全部掃描結果，不受篩選器限制
+        if all_view.empty:
+            st.caption("掃描結果為空，無法顯示 K 線圖")
+        else:
+            ticker_opts = [
+                f"{row['代號']}  {row['名稱']}  ({row['評級']} {row['評分']:.0f}分)"
+                for _, row in all_view.iterrows()
+            ]
+            sel_opt  = st.selectbox("選擇股票查看 K 線圖", ticker_opts, index=0)
+            sel_id   = sel_opt.strip().split()[0]
+            sel_name = STOCK_NAMES.get(sel_id, sel_id)
+
+            end_dt   = datetime.today().strftime("%Y-%m-%d")
+            start_dt = (datetime.today() - timedelta(days=380)).strftime("%Y-%m-%d")
+            with st.spinner(f"載入 {sel_id} {sel_name}…"):
                 cdf = fetch_price(sel_id, start_dt, end_dt, token)
-            if not cdf.empty:
+            if cdf.empty:
+                st.warning(f"無法取得 {sel_id} 資料")
+            else:
                 tdf = fetch_taiex(start_dt, end_dt, token)
                 cdf = compute_all_indicators(cdf, tdf)
-                st.plotly_chart(build_chart(cdf, sel_id, sel_name),
-                                use_container_width=True,
-                                config={"displayModeBar":True,
-                                        "toImageButtonOptions":{"filename":f"{sel_id}_chart","scale":2}})
+                # 取得該股的 zones
+                matched = all_view[all_view["代號"] == sel_id]
+                zones   = matched.iloc[0]["_zones"] if not matched.empty else {}
+                st.plotly_chart(
+                    build_chart(cdf, sel_id, sel_name),
+                    use_container_width=True,
+                    config={"displayModeBar": True,
+                            "toImageButtonOptions": {"filename": f"{sel_id}_chart", "scale": 2}}
+                )
 
     # ════════════════════════════════════════
     # Tab 2：自選股分析
