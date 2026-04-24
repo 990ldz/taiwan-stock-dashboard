@@ -218,6 +218,13 @@ def fetch_price(stock_id: str, start: str, end: str, token: str = "") -> pd.Data
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_taiex(start: str, end: str, token: str = "") -> pd.DataFrame:
+    """
+    取得加權指數資料。
+    嘗試順序：
+      ① TaiwanStockMarketIndex（data_id=TAIEX / Y9999 / 空）
+      ② 備用：抓 0050（元大台灣50）作為大盤代理
+    """
+    # ── 方法一：標準大盤指數 API ──────────────────────────────
     for did in ["TAIEX", "Y9999", ""]:
         params = {"dataset": "TaiwanStockMarketIndex", "start_date": start, "end_date": end}
         if did:
@@ -232,7 +239,7 @@ def fetch_taiex(start: str, end: str, token: str = "") -> pd.DataFrame:
             df = pd.DataFrame(d["data"])
             df["date"] = pd.to_datetime(df["date"])
             df = df.sort_values("date").reset_index(drop=True)
-            for col in ["price","Price","close","Close"]:
+            for col in ["price", "Price", "close", "Close"]:
                 if col in df.columns:
                     df["Close"] = pd.to_numeric(df[col], errors="coerce")
                     break
@@ -248,6 +255,28 @@ def fetch_taiex(start: str, end: str, token: str = "") -> pd.DataFrame:
             return df
         except Exception:
             continue
+
+    # ── 方法二：用 0050 當大盤代理（免 token 也可取）──────────
+    try:
+        params = {"dataset": "TaiwanStockPrice", "data_id": "0050",
+                  "start_date": start, "end_date": end}
+        if token:
+            params["token"] = token
+        r = requests.get(FINMIND_API, params=params, timeout=20)
+        d = r.json()
+        if d.get("status") == 200 and d.get("data"):
+            df = pd.DataFrame(d["data"])
+            df = df.rename(columns={"close": "Close", "open": "Open",
+                                     "max": "High", "min": "Low",
+                                     "Trading_Volume": "Volume"})
+            df["date"]  = pd.to_datetime(df["date"])
+            df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+            df = df.sort_values("date").dropna(subset=["Close"]).reset_index(drop=True)
+            if len(df) >= 10:
+                return df
+    except Exception:
+        pass
+
     return pd.DataFrame()
 
 
@@ -350,10 +379,444 @@ def compute_all_indicators(df: pd.DataFrame, taiex_df: pd.DataFrame = None) -> p
 
 
 # ════════════════════════════════════════════════════════════════
-# ⑥ 三大策略評分函式
+# ⑤-b  FinMind 基本面資料（月營收）
 # ════════════════════════════════════════════════════════════════
 
-# ── 6-A 長線：Stan Weinstein Stage 2 ─────────────────────────
+@st.cache_data(ttl=86400, show_spinner=False)   # 基本面資料每日更新一次
+def fetch_monthly_revenue(sid: str, token: str = "") -> pd.DataFrame:
+    """
+    取得個股月營收資料（TaiwanStockMonthRevenue）
+    回傳欄位：date / revenue（當月） / revenue_year（去年同月）
+    用途：計算 YoY 年增率
+    """
+    end   = datetime.today().strftime("%Y-%m-%d")
+    start = (datetime.today() - timedelta(days=450)).strftime("%Y-%m-%d")
+    params = {"dataset": "TaiwanStockMonthRevenue", "data_id": sid,
+              "start_date": start, "end_date": end}
+    if token:
+        params["token"] = token
+    try:
+        r = requests.get(FINMIND_API, params=params, timeout=15)
+        d = r.json()
+        if d.get("status") != 200 or not d.get("data"):
+            return pd.DataFrame()
+        df = pd.DataFrame(d["data"])
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date").reset_index(drop=True)
+        for col in ["revenue", "Revenue", "revenue_month"]:
+            if col in df.columns:
+                df["revenue"] = pd.to_numeric(df[col], errors="coerce")
+                break
+        return df.dropna(subset=["revenue"])
+    except Exception:
+        return pd.DataFrame()
+
+
+# ════════════════════════════════════════════════════════════════
+# ⑥  G.P.S. 全方位選股評分系統
+# ════════════════════════════════════════════════════════════════
+#
+#  設計哲學：「由大到小，先看環境再選個股」
+#  參考：科斯托蘭尼、巴菲特、Mgk、蔣承翰、川銀藏
+#
+#  ┌──────────────────────────────────────────────────────────┐
+#  │  Stage 1  Global Market  大盤環境      20 分             │
+#  │  Stage 2  Peer Group     族群動能      25 分             │
+#  │  Stage 3  Stock Tech     個股強勢度    35 分             │
+#  │  Stage 4  Fundamental    護城河與未來  20 分             │
+#  │  ───────────────────────────────────────────────        │
+#  │  死亡過濾  大盤跌破 60MA             −40 分             │
+#  │  滿分                               100 分             │
+#  └──────────────────────────────────────────────────────────┘
+#
+#  評級行動指令：
+#    85-100  AAA 極致強勢 → 全力出擊，波段重倉
+#    70-84   AA  穩健進攻 → 分批進場
+#    50-69   B   技術反彈 → 嚴禁重倉，小量短線
+#    <50     C   高風險區 → 絕對空手
+# ════════════════════════════════════════════════════════════════
+
+# 已知具明顯護城河的台股（用於 F2 評分）
+MOAT_STOCKS = {
+    "2330","2454","2303","3711","6415",   # 半導體龍頭
+    "2412","3045","4904",                  # 電信壟斷
+    "2882","2881","2886",                  # 大型金融
+    "1301","1303","1326","6505",           # 石化整合
+    "2317","2382",                         # 供應鏈龍頭
+    "2912","5903",                         # 通路護城河
+}
+
+
+def score_gps(
+    df: pd.DataFrame,
+    market_data: dict,
+    sector_stats: dict,
+    rev_df: pd.DataFrame = None,
+    sid: str = "",
+) -> dict:
+    """
+    G.P.S. 全方位選股評分（100 分制）。
+
+    Parameters
+    ----------
+    df           : 個股含指標的 DataFrame
+    market_data  : get_market_state() 回傳的大盤狀態
+    sector_stats : compute_sector_stats() 回傳的族群資料
+    rev_df       : fetch_monthly_revenue() 回傳的月營收資料（可為 None）
+    sid          : 股票代號（用於護城河判斷）
+    """
+    if len(df) < 20:
+        return _gps_empty("資料不足")
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) >= 2 else last
+    close = float(last["Close"])
+
+    def _v(col):
+        v = last.get(col)
+        return float(v) if v is not None and not pd.isna(v) else np.nan
+
+    breakdown = []
+    raw = 0.0
+
+    # ════════════════════════════════════════
+    # Stage 1：Global Market 大盤環境（20分）
+    # ════════════════════════════════════════
+
+    # G1：大盤站上 20MA（月線）+10
+    mkt_above_20 = market_data.get("above_20ma", False)
+    pts = 10
+    raw += pts if mkt_above_20 else 0
+    breakdown.append({
+        "stage": "G", "label": "大盤站上 20MA（月線）",
+        "pts": pts, "met": mkt_above_20,
+        "detail": f"大盤 20MA 濾網：{'✅ 月線多頭' if mkt_above_20 else '❌ 月線偏空'}",
+    })
+
+    # G2：市場情緒未過熱（大盤 RSI < 75 且非恐慌）+10
+    mkt_rsi = market_data.get("rsi", 50)
+    mkt_no_panic = market_data.get("no_panic", True)
+    mkt_calm = mkt_rsi < 75 and mkt_no_panic
+    pts = 10
+    raw += pts if mkt_calm else 0
+    breakdown.append({
+        "stage": "G", "label": "市場情緒健康（RSI未過熱、無系統恐慌）",
+        "pts": pts, "met": mkt_calm,
+        "detail": f"大盤 RSI={mkt_rsi:.0f}（>75 代表過熱）",
+    })
+
+    # G 死亡過濾：大盤跌破 60MA（季線）→ 強制 -40
+    mkt_below_60 = market_data.get("below_60ma", False)
+    death_trigger = False
+    if mkt_below_60:
+        raw -= 40
+        death_trigger = True
+        breakdown.append({
+            "stage": "G", "label": "⚠️ 死亡過濾：大盤跌破 60MA 季線",
+            "pts": -40, "met": True,
+            "detail": "大盤處於空頭格局，勝率極低，強烈建議空手",
+        })
+
+    # ════════════════════════════════════════
+    # Stage 2：Peer Group 族群動能（25分）
+    # ════════════════════════════════════════
+
+    sector_avg_chg   = sector_stats.get("avg_chg", 0.0)
+    sector_strong_cnt= sector_stats.get("strong_count", 0)    # 上漲 >3% 的檔數
+    sector_vol_rank  = sector_stats.get("vol_rank", 99)        # 成交值排名（越小越好）
+
+    # P1：龍頭帶領（族群 2 檔以上強勢，或平均漲幅 >3%）+15
+    p1_ok = sector_strong_cnt >= 2 or sector_avg_chg > 3.0
+    pts = 15
+    raw += pts if p1_ok else 0
+    breakdown.append({
+        "stage": "P", "label": "族群龍頭帶領（≥2檔強勢 或 均漲>3%）",
+        "pts": pts, "met": p1_ok,
+        "detail": f"族群平均漲 {sector_avg_chg:+.1f}%，強勢股 {sector_strong_cnt} 檔",
+    })
+
+    # P2：資金匯集（族群成交值排名前 5）+10
+    p2_ok = sector_vol_rank <= 5
+    pts = 10
+    raw += pts if p2_ok else 0
+    breakdown.append({
+        "stage": "P", "label": "族群成交值前 5（資金匯集）",
+        "pts": pts, "met": p2_ok,
+        "detail": f"族群成交值排名第 {sector_vol_rank}（共 {len(SECTOR_STOCKS)} 個產業）",
+    })
+
+    # ════════════════════════════════════════
+    # Stage 3：Stock Technical 個股強勢度（35分）
+    # ════════════════════════════════════════
+
+    # S1：相對強度 RS（大盤跌它不跌，或創高）+15
+    rs_3m = _v("RS_3m")
+    s1_ok = not np.isnan(rs_3m) and rs_3m > 0
+    pts = 15
+    raw += pts if s1_ok else 0
+    breakdown.append({
+        "stage": "S", "label": "相對強度 RS 優於大盤",
+        "pts": pts, "met": s1_ok,
+        "detail": f"RS（3個月）= {rs_3m*100:+.1f}%" if not np.isnan(rs_3m) else "RS 無大盤資料",
+    })
+
+    # S2：量價爆發（量 > 5日均量 1.5×，且收在振幅前 1/3）+10
+    vol_today  = float(last.get("Volume", 0))
+    vol_5d     = float(df["Volume"].tail(6).iloc[:-1].mean()) if len(df) >= 6 else 0
+    vol_burst  = vol_5d > 0 and vol_today > vol_5d * 1.5
+    # 收在振幅前 1/3：(Close - Low) / (High - Low) > 2/3
+    hi = float(last.get("High", close)); lo = float(last.get("Low", close))
+    range_pos  = (close - lo) / (hi - lo) if (hi - lo) > 0 else 0.5
+    s2_ok = vol_burst and range_pos > 0.667
+    pts = 10
+    raw += pts if s2_ok else 0
+    breakdown.append({
+        "stage": "S", "label": "量價爆發（量>5日均量1.5×，收盤在振幅前1/3）",
+        "pts": pts, "met": s2_ok,
+        "detail": (f"量比={vol_today/vol_5d:.1f}×，振幅位置={range_pos*100:.0f}%"
+                   if vol_5d > 0 else "成交量資料不足"),
+    })
+
+    # S3：均線多頭排列 MA5>MA10>MA20>MA60 +10
+    ma5 = _v("MA5"); ma10 = _v("MA10"); ma20 = _v("MA20"); ma60 = _v("MA60")
+    s3_ok = (not any(np.isnan(x) for x in [ma5,ma10,ma20,ma60]) and
+             ma5 > ma10 > ma20 > ma60)
+    pts = 10
+    raw += pts if s3_ok else 0
+    breakdown.append({
+        "stage": "S", "label": "均線多頭排列（MA5>MA10>MA20>MA60）",
+        "pts": pts, "met": s3_ok,
+        "detail": (f"MA5={ma5:.1f} MA10={ma10:.1f} MA20={ma20:.1f} MA60={ma60:.1f}"
+                   if not any(np.isnan(x) for x in [ma5,ma10,ma20,ma60]) else "均線資料不足"),
+    })
+
+    # ════════════════════════════════════════
+    # Stage 4：Fundamental 護城河與未來（20分）
+    # ════════════════════════════════════════
+
+    # F1：近一季營收 YoY > 20% +10
+    f1_ok = False
+    f1_detail = "月營收資料無法取得"
+    if rev_df is not None and len(rev_df) >= 14:
+        try:
+            # 取最新月份 vs 去年同月
+            latest    = rev_df.iloc[-1]["revenue"]
+            year_ago  = rev_df.iloc[-13]["revenue"]   # 往前推 12 個月
+            yoy       = (latest - year_ago) / year_ago * 100 if year_ago > 0 else 0
+            f1_ok     = yoy > 20
+            f1_detail = f"最新月營收 YoY = {yoy:+.1f}%（需>20%）"
+        except Exception:
+            f1_detail = "YoY 計算失敗（資料不足）"
+    pts = 10
+    raw += pts if f1_ok else 0
+    breakdown.append({
+        "stage": "F", "label": "近一季月營收 YoY > 20%",
+        "pts": pts, "met": f1_ok,
+        "detail": f1_detail,
+    })
+
+    # F2：具備護城河（護城河清單 or 毛利率提升）+10
+    is_moat = sid in MOAT_STOCKS
+    f2_ok = is_moat   # 基礎：在已知護城河清單中
+    f2_detail = ("已知護城河企業（寡占 / 技術領先 / 品牌壟斷）"
+                 if is_moat else "非護城河清單，暫以 RS 代替")
+    # 若不在護城河清單，但 RS 非常強（>10%），給予部分認可
+    if not is_moat and not np.isnan(rs_3m) and rs_3m > 0.10:
+        f2_ok = True
+        f2_detail = f"非護城河清單，但 RS 極強（+{rs_3m*100:.1f}%），視為市場認可"
+    pts = 10
+    raw += pts if f2_ok else 0
+    breakdown.append({
+        "stage": "F", "label": "具備護城河（寡占／技術領先／品牌）",
+        "pts": pts, "met": f2_ok,
+        "detail": f2_detail,
+    })
+
+    # ── 最終計算 ─────────────────────────────────────────────
+    final = float(max(0.0, min(100.0, raw)))
+
+    # 評級
+    if final >= 85:
+        grade = "AAA"; grade_label = "極致強勢"; grade_action = "全力出擊，波段重倉"
+        grade_color = "#00c87a"
+    elif final >= 70:
+        grade = "AA";  grade_label = "穩健進攻"; grade_action = "分批進場"
+        grade_color = "#80d840"
+    elif final >= 50:
+        grade = "B";   grade_label = "技術反彈"; grade_action = "嚴禁重倉，小量短線"
+        grade_color = "#f0a500"
+    else:
+        grade = "C";   grade_label = "高風險區"; grade_action = "絕對空手"
+        grade_color = "#ff5c5c"
+
+    # 買進信號：AA 以上 + 無死亡過濾
+    signal = final >= 70 and not death_trigger
+
+    # 原因文字（正向條件）
+    pos_items = [b["label"] for b in breakdown if b["met"] and b["pts"] > 0]
+    neg_items = [b["label"] for b in breakdown if b["met"] and b["pts"] < 0]
+    reason_parts = []
+    if pos_items:
+        reason_parts.append("✅ " + " ｜ ".join(pos_items))
+    if neg_items:
+        reason_parts.append("🔴 " + " ｜ ".join(neg_items))
+    reason = "  ".join(reason_parts) if reason_parts else "⬜ 未達任何條件"
+
+    warning = ""
+    if death_trigger:
+        warning = "⚠️ 死亡過濾觸發：大盤跌破季線，極度不建議進場"
+    elif final < 50:
+        warning = f"⚠️ 評分 {final:.0f} 分，屬高風險區（C 級），建議觀望"
+
+    return {
+        "signal":      signal,
+        "score":       final,
+        "grade":       grade,
+        "grade_label": grade_label,
+        "grade_action":grade_action,
+        "grade_color": grade_color,
+        "reason":      reason,
+        "warning":     warning,
+        "breakdown":   breakdown,
+        "death_trigger": death_trigger,
+        # 各階段分數（用於雷達圖/明細）
+        "score_G": sum(b["pts"] for b in breakdown if b["stage"]=="G" and b["met"]),
+        "score_P": sum(b["pts"] for b in breakdown if b["stage"]=="P" and b["met"]),
+        "score_S": sum(b["pts"] for b in breakdown if b["stage"]=="S" and b["met"]),
+        "score_F": sum(b["pts"] for b in breakdown if b["stage"]=="F" and b["met"]),
+    }
+
+
+def _gps_empty(reason: str = "") -> dict:
+    return {
+        "signal":False,"score":0.0,"grade":"C","grade_label":"資料不足",
+        "grade_action":"無法評分","grade_color":"#ff5c5c",
+        "reason":reason,"warning":reason,"breakdown":[],
+        "death_trigger":False,
+        "score_G":0,"score_P":0,"score_S":0,"score_F":0,
+    }
+
+
+# ════════════════════════════════════════════════════════════════
+# ⑥-b  族群資料計算（Peer Group Stats）
+# ════════════════════════════════════════════════════════════════
+
+def compute_sector_stats(sector_dfs: dict[str, list[float]]) -> dict[str, dict]:
+    """
+    輸入：{產業名稱: [各股今日漲跌%]} 字典
+    輸出：{產業名稱: {avg_chg, strong_count, vol_rank}} 字典
+
+    在掃描開始前輕量計算，供 GPS P 階段使用。
+    """
+    sector_stats = {}
+    sector_volumes = {}   # {產業: 平均成交量（用於排名）}
+
+    for sector, chgs_vols in sector_dfs.items():
+        chgs = [cv[0] for cv in chgs_vols]
+        vols = [cv[1] for cv in chgs_vols]
+        avg_chg      = float(np.mean(chgs)) if chgs else 0.0
+        strong_count = sum(1 for c in chgs if c > 3.0)
+        avg_vol      = float(np.mean(vols)) if vols else 0.0
+        sector_stats[sector]   = {"avg_chg": avg_chg, "strong_count": strong_count}
+        sector_volumes[sector] = avg_vol
+
+    # 計算成交值排名
+    sorted_sectors = sorted(sector_volumes, key=lambda s: sector_volumes[s], reverse=True)
+    for rank, sec in enumerate(sorted_sectors, 1):
+        sector_stats[sec]["vol_rank"] = rank
+
+    return sector_stats
+
+
+# ════════════════════════════════════════════════════════════════
+# ⑥-c  大盤狀態（升級版，供 GPS 使用）
+# ════════════════════════════════════════════════════════════════
+
+def get_market_state(token: str = "") -> dict:
+    """取得大盤狀態，回傳 GPS Stage 1 需要的欄位。"""
+    end   = datetime.today().strftime("%Y-%m-%d")
+    start = (datetime.today() - timedelta(days=380)).strftime("%Y-%m-%d")
+    df = fetch_taiex(start, end, token)
+
+    base = {
+        "signal": "neutral", "status": "無法取得",
+        "close": None, "ma20": None, "ma60": None, "ma240": None,
+        "rsi": 50.0, "pos_ratio": 0.7, "date": "N/A",
+        "above_20ma": False, "below_60ma": False, "no_panic": True,
+    }
+
+    if df.empty or len(df) < 60:
+        return base
+
+    df = compute_all_indicators(df)
+    last = df.iloc[-1]
+
+    cl   = float(last["Close"])
+    m20  = float(last["MA20"])  if not pd.isna(last.get("MA20"))  else None
+    m60  = float(last["MA60"])  if not pd.isna(last.get("MA60"))  else None
+    m240 = float(last["MA240"]) if not pd.isna(last.get("MA240")) else None
+    rsi  = float(last["RSI"])   if not pd.isna(last.get("RSI"))   else 50.0
+
+    above_20 = m20  is not None and cl > m20
+    above_60 = m60  is not None and cl > m60
+    below_60 = m60  is not None and cl < m60
+    above_240= m240 is not None and cl > m240
+
+    if above_60 and above_240:
+        signal = "bullish"; status = "強多頭"; pos = 1.0
+    elif above_60:
+        signal = "neutral"; status = "弱多頭"; pos = 0.7
+    else:
+        signal = "bearish"; status = "空頭警示"; pos = 0.3
+
+    return {
+        "signal":     signal, "status":  status,
+        "close":      cl,     "ma20":    m20,
+        "ma60":       m60,    "ma240":   m240,
+        "rsi":        rsi,
+        "pos_ratio":  pos,
+        "date":       last["date"].strftime("%Y-%m-%d"),
+        "above_20ma": above_20,
+        "below_60ma": below_60,
+        "no_panic":   rsi < 80,   # RSI > 80 視為市場過熱
+    }
+
+
+# ── 保留三個原始評分函式以供向下相容（自選股三線分析仍需要）──────
+def score_longterm(df, **_):  return _compat_score(df, "long")
+def score_midterm(df,  **_):  return _compat_score(df, "mid")
+def score_shortterm(df,**_):  return _compat_score(df, "short")
+
+def _compat_score(df, mode):
+    """快速模式：提供向下相容的分數，供舊版 analyze_custom_stock 使用"""
+    if len(df) < 20: return {"signal":False,"score":0,"reason":"資料不足","breakdown":[],"warning":""}
+    last = df.iloc[-1]
+    def _v(c): return float(last[c]) if not pd.isna(last.get(c)) else np.nan
+    close=float(last["Close"]); ma20=_v("MA20"); ma60=_v("MA60"); ma240=_v("MA240")
+    rsi=_v("RSI"); macd_h=_v("MACD_hist"); rs=_v("RS_3m")
+    sl60=_v("MA60_slope"); sl240=_v("MA240_slope")
+    vol=float(last.get("Volume",0)); p_vol=float(df.iloc[-2].get("Volume",1) if len(df)>=2 else 1)
+    score=0; bd=[]; sig=False
+    if mode=="short":
+        c1=not np.isnan(ma20) and close>ma20;   score+=25 if c1 else 0; bd.append(("站上20MA",25,c1,""))
+        c2=not np.isnan(rsi) and 50<=rsi<=70;   score+=25 if c2 else 0; bd.append((f"RSI甜蜜區{rsi:.0f}",25,c2,""))
+        c3=not np.isnan(macd_h) and macd_h>0;   score+=25 if c3 else 0; bd.append(("MACD向上",25,c3,""))
+        c4=p_vol>0 and vol>p_vol*1.5;            score+=25 if c4 else 0; bd.append(("今日爆量",25,c4,""))
+        sig=score>=70 and c1
+    elif mode=="mid":
+        c1=not np.isnan(ma60) and close>ma60 and not np.isnan(sl60) and sl60>0; score+=50 if c1 else 0; bd.append(("季線多頭",50,c1,""))
+        c2=not np.isnan(rs) and rs>0;            score+=30 if c2 else 0; bd.append(("RS優於大盤",30,c2,""))
+        c3=not np.isnan(ma20) and close>ma20;    score+=20 if c3 else 0; bd.append(("站上月線",20,c3,""))
+        sig=score>=60 and c1
+    else:
+        c1=not np.isnan(ma240) and close>ma240 and not np.isnan(sl240) and sl240>0; score+=55 if c1 else 0; bd.append(("年線多頭",55,c1,""))
+        c2=not np.isnan(rs) and rs>0;            score+=25 if c2 else 0; bd.append(("RS優於大盤",25,c2,""))
+        c3=not np.isnan(ma20) and close>ma20;    score+=20 if c3 else 0; bd.append(("站上月線",20,c3,""))
+        sig=score>=65 and c1
+    pos=[b[0] for b in bd if b[2] and b[1]>0]
+    return {"signal":sig,"score":float(min(100,score)),"reason":"✅ "+" ｜ ".join(pos) if pos else "⬜ 未達條件",
+            "breakdown":bd,"warning":""}
+
 #
 # Stage 2 = 股票進入主升段
 # 必要條件：
@@ -596,41 +1059,6 @@ def score_shortterm(df: pd.DataFrame) -> dict:
         raw -= 20
         breakdown.append(("RSI 過熱 > 75（懲罰，追高風險）", -20, True, f"RSI={rsi:.1f}"))
 
-    final = float(max(0.0, min(100.0, raw)))
-    signal = (final >= 60) and (rsi_ok or macd_bull) and (c5ma or c20ma) and (not overbought)
-
-    return _build_result("短線", final, signal, breakdown, last, extra={"vol_ratio": vol_r})
-
-
-# ── 共用輔助函式 ───────────────────────────────────────────────
-
-def _empty_score(mode: str, reason: str) -> dict:
-    return {"mode": mode, "signal": False, "score": 0.0,
-            "reason": reason, "breakdown": [], "warning": "",
-            "last": {}}
-
-def _build_result(mode: str, score: float, signal: bool,
-                  breakdown: list, last: pd.Series, extra: dict = None) -> dict:
-    pos = [f"✅ {lbl}" for lbl, pts, met, detail in breakdown if met and pts > 0]
-    neg = [f"🔴 {lbl}" for lbl, pts, met, detail in breakdown if met and pts < 0]
-    parts = []
-    if pos: parts.append(" ｜ ".join(pos))
-    if neg: parts.append(" ｜ ".join(neg))
-    reason = "  ".join(parts) if parts else "⬜ 未達任何條件"
-
-    warning = ""
-    for lbl, pts, met, detail in breakdown:
-        if met and pts < 0:
-            warning = f"⚠️ {lbl}（{detail}）" if detail else f"⚠️ {lbl}"
-            break
-
-    result = {"mode": mode, "signal": signal, "score": score,
-              "reason": reason, "breakdown": breakdown,
-              "warning": warning, "last": dict(last)}
-    if extra:
-        result.update(extra)
-    return result
-
 
 # ════════════════════════════════════════════════════════════════
 # ⑦ 改良版買賣建議（Van Tharp ATR × Fibonacci 雙驗證）
@@ -826,7 +1254,8 @@ def get_market_state(token: str = "") -> dict:
 # ════════════════════════════════════════════════════════════════
 
 def scan_sector(sector: str, token: str, taiex_df: pd.DataFrame,
-                start: str, end: str, max_per_sector: int = 5) -> list[dict]:
+                start: str, end: str, max_per_sector: int,
+                market_data: dict, sector_stats: dict) -> list[dict]:
     stocks  = SECTOR_STOCKS.get(sector, [])[:max_per_sector]
     results = []
 
@@ -835,43 +1264,48 @@ def scan_sector(sector: str, token: str, taiex_df: pd.DataFrame,
         if df.empty or len(df) < 30:
             time.sleep(0.2); continue
 
-        df = compute_all_indicators(df, taiex_df)
+        df      = compute_all_indicators(df, taiex_df)
+        rev_df  = fetch_monthly_revenue(sid, token)
+        sec_st  = sector_stats.get(sector, {"avg_chg":0,"strong_count":0,"vol_rank":99})
 
-        for mode, score_fn, bt_mode in [
-            ("short", score_shortterm, "short"),
-            ("mid",   score_midterm,   "mid"),
-            ("long",  score_longterm,  "long"),
-        ]:
-            sc = score_fn(df)
-            if sc["score"] < 40:
-                continue   # 太低的跳過，節省後面運算
+        gps     = score_gps(df, market_data, sec_st, rev_df, sid)
 
-            bt = quick_backtest(df, bt_mode)
-            zones = compute_trade_zones(df, mode)
-            last  = df.iloc[-1]
-            prev  = df.iloc[-2] if len(df) >= 2 else last
-            chg   = (float(last["Close"]) - float(prev["Close"])) / float(prev["Close"]) * 100
+        # 跳過 C 級（< 50），減少 API 消耗
+        if gps["score"] < 50:
+            time.sleep(0.2); continue
 
-            results.append({
-                "代號":      sid,
-                "名稱":      STOCK_NAMES.get(sid, sid),
-                "產業":      sector,
-                "持有週期":  {"short":"短線 7日","mid":"中線 6-12月","long":"長線 1年+"}[mode],
-                "收盤價":    round(float(last["Close"]), 1),
-                "漲跌%":     round(chg, 2),
-                "信號":      "✅ 買進" if sc["signal"] else "⬜ 觀察",
-                "評分":      round(sc["score"], 1),
-                "原因":      sc["reason"],
-                "警告":      sc.get("warning", ""),
-                "回測報酬%": bt["return"],
-                "勝率%":     bt["win_rate"],
-                "MDD%":      bt["mdd"],
-                "_mode":     mode,
-                "_zones":    zones,
-                "_score_obj":sc,
-            })
+        bt    = quick_backtest(df, "mid")
+        zones = compute_trade_zones(df, "short")
+        last  = df.iloc[-1]
+        prev  = df.iloc[-2] if len(df) >= 2 else last
+        chg   = (float(last["Close"]) - float(prev["Close"])) / float(prev["Close"]) * 100
 
-        time.sleep(0.25)
+        results.append({
+            "代號":       sid,
+            "名稱":       STOCK_NAMES.get(sid, sid),
+            "產業":       sector,
+            "收盤價":     round(float(last["Close"]), 1),
+            "漲跌%":      round(chg, 2),
+            "信號":       "✅ 買進" if gps["signal"] else "⬜ 觀察",
+            "評分":       round(gps["score"], 1),
+            "評級":       gps["grade"],
+            "評級標籤":   gps["grade_label"],
+            "行動":       gps["grade_action"],
+            "評級色":     gps["grade_color"],
+            "原因":       gps["reason"],
+            "警告":       gps["warning"],
+            "G分":        gps["score_G"],
+            "P分":        gps["score_P"],
+            "S分":        gps["score_S"],
+            "F分":        gps["score_F"],
+            "回測報酬%":  bt["return"],
+            "勝率%":      bt["win_rate"],
+            "MDD%":       bt["mdd"],
+            "_mode":      "mid",
+            "_zones":     zones,
+            "_gps":       gps,
+        })
+        time.sleep(0.3)
 
     return results
 
@@ -881,20 +1315,49 @@ def run_full_scan(sectors: list, token: str, max_per_sector: int) -> pd.DataFram
     end   = datetime.today().strftime("%Y-%m-%d")
     start = (datetime.today() - timedelta(days=380)).strftime("%Y-%m-%d")
 
-    taiex_df = fetch_taiex(start, end, token)
+    taiex_df    = fetch_taiex(start, end, token)
+    market_data = get_market_state(token)   # GPS Stage 1 資料
 
-    all_results = []
     prog = st.progress(0.0)
     stat = st.empty()
 
+    # ── Phase 1：輕量預掃描（取得族群動能資料）──────────────
+    stat.markdown(
+        "<span style='color:#4a8aaa;font-size:0.8rem;'>⚡ 預掃描族群動能（Phase 1）…</span>",
+        unsafe_allow_html=True
+    )
+    sector_raw: dict[str, list] = {}   # {sector: [(chg%, vol)]}
+    pre_start = (datetime.today() - timedelta(days=10)).strftime("%Y-%m-%d")
+
+    for i, sector in enumerate(sectors):
+        prog.progress((i + 1) / len(sectors) * 0.3)   # 前 30% 進度給預掃描
+        chgs_vols = []
+        for sid in SECTOR_STOCKS.get(sector, [])[:4]:  # 每產業取 4 檔代表
+            try:
+                df_tmp = fetch_price(sid, pre_start, end, token)
+                if df_tmp.empty or len(df_tmp) < 2: continue
+                chg = (float(df_tmp.iloc[-1]["Close"]) - float(df_tmp.iloc[-2]["Close"])) \
+                      / float(df_tmp.iloc[-2]["Close"]) * 100
+                vol = float(df_tmp.iloc[-1].get("Volume", 0))
+                chgs_vols.append((chg, vol))
+                time.sleep(0.15)
+            except Exception:
+                continue
+        sector_raw[sector] = chgs_vols
+
+    sector_stats = compute_sector_stats(sector_raw)
+
+    # ── Phase 2：完整個股 GPS 評分 ────────────────────────────
+    all_results = []
     for i, sector in enumerate(sectors):
         stat.markdown(
-            f"<span style='color:#4a8aaa;font-size:0.8rem;'>📡 掃描 {sector} 產業…"
+            f"<span style='color:#4a8aaa;font-size:0.8rem;'>📊 GPS 評分 {sector} 產業…"
             f"（{i+1}/{len(sectors)}）</span>",
             unsafe_allow_html=True
         )
-        prog.progress((i + 1) / len(sectors))
-        rows = scan_sector(sector, token, taiex_df, start, end, max_per_sector)
+        prog.progress(0.3 + (i + 1) / len(sectors) * 0.7)
+        rows = scan_sector(sector, token, taiex_df, start, end,
+                           max_per_sector, market_data, sector_stats)
         all_results.extend(rows)
 
     prog.empty(); stat.empty()
@@ -903,7 +1366,7 @@ def run_full_scan(sectors: list, token: str, max_per_sector: int) -> pd.DataFram
         return pd.DataFrame()
 
     df = pd.DataFrame(all_results)
-    df = df.sort_values(["信號","評分"], ascending=[False, False]).reset_index(drop=True)
+    df = df.sort_values(["評分"], ascending=False).reset_index(drop=True)
     return df
 
 
@@ -996,9 +1459,11 @@ def build_chart(df: pd.DataFrame, sid: str, name: str) -> go.Figure:
     if "Volume" in df.columns:
         vol_c = [_UP if float(c) >= float(o) else _DN
                  for c, o in zip(df["Close"], df["Open"])]
+        # 使用 rgba 格式，不用 8 位 hex（Plotly 不接受 #rrggbbaa 格式）
+        vol_rgba = ["rgba(0,200,122,0.45)" if c == _UP else "rgba(255,92,92,0.45)"
+                    for c in vol_c]
         fig.add_trace(go.Bar(x=df["date"], y=df["Volume"],
-            marker_color=[c.replace(")", ",0.5)").replace("rgb","rgba") if c.startswith("rgb") else c + "80"
-                           for c in vol_c],
+            marker_color=vol_rgba,
             showlegend=False,
             hovertemplate="量：%{y:,.0f}<extra></extra>"), row=2, col=1)
 
@@ -1013,9 +1478,11 @@ def build_chart(df: pd.DataFrame, sid: str, name: str) -> go.Figure:
 
     # ── Row 4: MACD ──────────────────────────────────────────
     if "MACD" in df.columns and df["MACD"].notna().any():
-        hist_c = [_UP if v > 0 else _DN for v in df["MACD_hist"].fillna(0)]
+        hist_c    = [_UP if v > 0 else _DN for v in df["MACD_hist"].fillna(0)]
+        hist_rgba = ["rgba(0,200,122,0.55)" if c == _UP else "rgba(255,92,92,0.55)"
+                     for c in hist_c]
         fig.add_trace(go.Bar(x=df["date"], y=df["MACD_hist"],
-            marker_color=[c + "90" for c in hist_c],
+            marker_color=hist_rgba,
             name="MACD 柱", showlegend=False), row=4, col=1)
         fig.add_trace(go.Scatter(x=df["date"], y=df["MACD"],
             line=dict(color="#4ab3ff", width=1.4), name="MACD"), row=4, col=1)
@@ -1104,27 +1571,41 @@ def render_zones(zones: dict, signal: bool) -> str:
 
 
 def render_card(row: dict | pd.Series) -> str:
-    mode = row.get("_mode", "mid")
-    badge_map = {"short": ("badge-short","⚡ 短線 7日"),
-                 "mid":   ("badge-mid",  "📊 中線 6-12M"),
-                 "long":  ("badge-long", "🔭 長線 1年+")}
-    badge_cls, badge_lbl = badge_map.get(mode, ("badge-mid","中線"))
-
-    signal = row.get("信號","") == "✅ 買進"
+    signal   = row.get("信號","") == "✅ 買進"
     card_cls = "card-bull" if signal else "card-bear"
-    sc   = float(row.get("評分", 0))
-    sc_c = score_color(sc)
-    bar  = int(sc)
+    sc       = float(row.get("評分", 0))
+    grade    = row.get("評級", "C")
+    g_lbl    = row.get("評級標籤", "")
+    g_act    = row.get("行動", "")
+    g_color  = row.get("評級色", "#ff5c5c")
 
     chg     = float(row.get("漲跌%", 0))
     chg_sym = "▲" if chg >= 0 else "▼"
     chg_cls = "#00c87a" if chg >= 0 else "#ff5c5c"
-
     ret     = float(row.get("回測報酬%", 0))
-    ret_sym = "+" if ret >= 0 else ""
     ret_c   = "#00c87a" if ret >= 0 else "#ff5c5c"
+    ret_sym = "+" if ret >= 0 else ""
 
-    reason_html = str(row.get("原因","")).replace(" ｜ ","<br>&nbsp;·&nbsp;")
+    # GPS 四階段分數條
+    sg = float(row.get("G分", 0)); sp = float(row.get("P分", 0))
+    ss = float(row.get("S分", 0)); sf = float(row.get("F分", 0))
+    def _seg(val, mx, clr, lbl):
+        pct = min(val / mx * 100, 100)
+        return (f'<div style="flex:1;margin:0 2px;">'
+                f'<div style="font-size:0.58rem;color:#3a6a8a;margin-bottom:2px;">{lbl}</div>'
+                f'<div style="background:#0e2030;border-radius:3px;height:5px;">'
+                f'<div style="width:{pct:.0f}%;height:100%;border-radius:3px;background:{clr};"></div></div>'
+                f'<div style="font-size:0.6rem;color:{clr};text-align:center;">{val:.0f}</div>'
+                f'</div>')
+
+    stage_bars = (
+        f'<div style="display:flex;margin:6px 0 10px;gap:2px;">'
+        f'{_seg(sg,20,"#4ab3ff","G大盤")}'
+        f'{_seg(sp,25,"#c084fc","P族群")}'
+        f'{_seg(ss,35,"#f0c040","S個股")}'
+        f'{_seg(sf,20,"#00c87a","F基本面")}'
+        f'</div>'
+    )
 
     warn = str(row.get("警告",""))
     warn_html = (
@@ -1133,38 +1614,39 @@ def render_card(row: dict | pd.Series) -> str:
         f'font-size:0.7rem;color:#ffaaaa;">{warn}</div>'
     ) if warn else ""
 
-    zones = row.get("_zones", {}) or {}
+    zones    = row.get("_zones", {}) or {}
     zones_html = render_zones(zones, signal)
+    reason_html= str(row.get("原因","")).replace(" ｜ ","<br>&nbsp;·&nbsp;")
 
     return f"""
     <div class="stock-card {card_cls}">
-      <div style="position:absolute;top:14px;right:16px;">
-        <span style="font-family:'IBM Plex Mono',monospace;font-size:1.4rem;
-                     font-weight:700;color:{sc_c};">{sc:.0f}</span>
-        <span style="color:#2a4a60;font-size:0.65rem;">/100</span>
+      <div style="position:absolute;top:12px;right:14px;text-align:right;">
+        <div style="font-family:'IBM Plex Mono',monospace;font-size:1.4rem;
+                    font-weight:700;color:{g_color};">{sc:.0f}</div>
+        <div style="background:{g_color}22;border:1px solid {g_color}55;border-radius:4px;
+                    padding:1px 6px;font-size:0.65rem;font-weight:700;color:{g_color};">
+          {grade} {g_lbl}</div>
       </div>
-      <div style="font-family:'IBM Plex Mono',monospace;font-size:0.75rem;color:#3a7a9a;">
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:0.72rem;color:#3a7a9a;">
         {row.get('代號','')} &nbsp;·&nbsp; {row.get('產業','')}
       </div>
-      <div style="font-size:1.1rem;font-weight:700;color:#e8f4f8;margin:2px 0 6px;">
+      <div style="font-size:1.1rem;font-weight:700;color:#e8f4f8;margin:2px 0 4px;">
         {row.get('名稱','')}
       </div>
-      <span class="card-badge {badge_cls}">{badge_lbl}</span>
-      <div style="background:#112030;border-radius:3px;height:4px;margin:5px 0 10px;">
-        <div style="width:{bar}%;height:100%;border-radius:3px;background:{sc_c};"></div>
-      </div>
+      <div style="font-size:0.7rem;color:#2a6a8a;margin-bottom:4px;">📋 {g_act}</div>
+      {stage_bars}
       <span style="font-family:'IBM Plex Mono',monospace;font-size:1.5rem;
                    font-weight:600;color:#e8f4f8;">
         {float(row.get('收盤價',0)):,.1f}
       </span>
       <span style="color:{chg_cls};font-size:0.9rem;">&nbsp;{chg_sym} {abs(chg):.2f}%</span>
       {warn_html}
-      <div style="margin-top:7px;font-size:0.72rem;color:#7aacb8;line-height:1.7;">
+      <div style="margin-top:7px;font-size:0.70rem;color:#6a9ab0;line-height:1.7;">
         {reason_html}
       </div>
       {zones_html}
       <hr style="border:none;border-top:1px solid #0e2030;margin:9px 0 7px;">
-      <div style="font-family:'IBM Plex Mono',monospace;font-size:0.79rem;color:#8aabb8;">
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:0.78rem;color:#8aabb8;">
         回測<span style="color:{ret_c};">&nbsp;{ret_sym}{ret:.1f}%</span>
         &ensp;勝率&nbsp;{float(row.get('勝率%',0)):.0f}%
         &ensp;MDD&nbsp;<span style="color:#ff7878;">{float(row.get('MDD%',0)):.1f}%</span>
@@ -1328,25 +1810,37 @@ def main():
     with st.spinner("載入大盤…"):
         mkt = get_market_state(token)
 
-    cls   = mkt["signal"]
-    cl_s  = mkt["close"]
-    m60_s = mkt.get("ma60")
-    m240_s= mkt.get("ma240")
-    pos_s = f"{mkt['pos_ratio']*100:.0f}%"
-    bar_cls = "ok-bar" if cls == "bullish" else ("warn-bar" if cls == "bearish" else "ok-bar")
-    cl_str  = f"{cl_s:,.2f}" if cl_s else "N/A"
-    m60_str = f"{m60_s:,.1f}"  if m60_s else "N/A"
-    m240_str= f"{m240_s:,.1f}" if m240_s else "N/A"
+    cls    = mkt["signal"]
+    cl_s   = mkt["close"]
+    m60_s  = mkt.get("ma60")
+    m240_s = mkt.get("ma240")
+    pos_s  = f"{mkt['pos_ratio']*100:.0f}%"
+    cl_str   = f"{cl_s:,.1f}"  if cl_s   else "—"
+    m60_str  = f"{m60_s:,.1f}" if m60_s  else "—"
+    m240_str = f"{m240_s:,.1f}" if m240_s else "—"
 
-    st.markdown(
-        f'<div class="{bar_cls}">'
-        f'加權指數 {mkt["date"]}：<b>{cl_str}</b>'
-        f'&nbsp;｜&nbsp; 60MA {m60_str} &nbsp; 240MA {m240_str}'
-        f'&nbsp;｜&nbsp; 大盤狀態：<b>{mkt["status"]}</b>'
-        f'&nbsp;｜&nbsp; 建議最大倉位：<b>{pos_s}</b>'
-        f'</div>',
-        unsafe_allow_html=True
-    )
+    if cl_s is None:
+        # 大盤無法取得：給清楚提示，不顯示 N/A
+        st.markdown(
+            '<div class="warn-bar">'
+            '⚠️ <b>大盤資料暫時無法取得</b>（FinMind 免費 Token 不支援大盤指數 API）。'
+            '建議：① 在左側填入 FinMind Token，或 ② 手動確認台股加權指數位置。'
+            '&nbsp; 選股功能不受影響，可正常使用。'
+            '</div>',
+            unsafe_allow_html=True
+        )
+    else:
+        bar_cls = "ok-bar" if cls == "bullish" else ("warn-bar" if cls == "bearish" else "ok-bar")
+        proxy_note = "（以 0050 代理）" if m240_s and m240_s < 200 else ""
+        st.markdown(
+            f'<div class="{bar_cls}">'
+            f'大盤 {mkt["date"]}{proxy_note}：<b>{cl_str}</b>'
+            f'&nbsp;｜&nbsp; 60MA {m60_str}&nbsp; 240MA {m240_str}'
+            f'&nbsp;｜&nbsp; 狀態：<b>{mkt["status"]}</b>'
+            f'&nbsp;｜&nbsp; 建議最大倉位：<b>{pos_s}</b>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
 
     # ── Tabs ─────────────────────────────────────────────────
     tab_scan, tab_custom, tab_method = st.tabs([
@@ -1403,23 +1897,25 @@ def main():
             view = view[view["信號"] == "✅ 買進"]
         view = view[view["評分"] >= min_score]
 
-        # 今日精選置頂（三個週期各取 top 1）
-        st.markdown('<div class="sec-title">今日最佳標的</div>', unsafe_allow_html=True)
+        # 今日精選置頂（買進信號，依評分前 5 名，每排 3 欄）
+        st.markdown('<div class="sec-title">今日最佳標的 Top 5</div>', unsafe_allow_html=True)
 
-        top_cards = []
-        for period in ["短線 7日","中線 6-12月","長線 1年+"]:
-            sub = view[view["持有週期"] == period]
-            sub = sub[sub["信號"] == "✅ 買進"]
-            if not sub.empty:
-                top_cards.append(sub.iloc[0])
+        top_cards = (view[view["信號"] == "✅ 買進"]
+                     .sort_values("評分", ascending=False)
+                     .head(5))
 
-        if not top_cards:
+        if top_cards.empty:
             st.markdown('<div class="warn-bar">目前無任何買進信號，市場偏弱，建議持盈保泰。</div>',
                         unsafe_allow_html=True)
         else:
-            tcols = st.columns(min(3, len(top_cards)))
-            for i, row in enumerate(top_cards):
-                tcols[i].markdown(render_card(row), unsafe_allow_html=True)
+            # 每排最多 3 欄，5 檔分兩排（3+2）
+            rows_of_cards = [top_cards.iloc[:3], top_cards.iloc[3:]]
+            for card_row in rows_of_cards:
+                if card_row.empty:
+                    continue
+                tcols = st.columns(len(card_row))
+                for i, (_, row) in enumerate(card_row.iterrows()):
+                    tcols[i].markdown(render_card(row), unsafe_allow_html=True)
 
         # 完整排行榜
         st.markdown(f'<div class="sec-title">完整排行榜（{len(view)} 筆）</div>',
