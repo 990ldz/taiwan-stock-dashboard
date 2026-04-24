@@ -1914,7 +1914,7 @@ def main():
                     st.session_state["scan_mode_used"] = scan_mode
 
         scan_df   = st.session_state.get("scan_df")
-        mode_used = st.session_state.get("scan_mode_used", scan_mode)
+        mode_used = st.session_state.get("scan_mode_used") or scan_mode
         mode_lbl  = {"short":"⚡ 短線 7日","mid":"📊 中線 6-12月","long":"🔭 長線 1年+"}[mode_used]
 
         if scan_df is None:
