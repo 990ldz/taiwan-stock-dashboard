@@ -354,6 +354,57 @@ def fetch_taiex(start: str, end: str, token: str = "") -> pd.DataFrame:
     return pd.DataFrame()
 
 
+@st.cache_data(ttl=7200, show_spinner=False)
+def fetch_news_sentiment(sid: str, name: str, token: str = "") -> dict:
+    """新聞情緒分析（FinMind 新聞 + Claude API）"""
+    end   = datetime.today().strftime("%Y-%m-%d")
+    start = (datetime.today() - timedelta(days=14)).strftime("%Y-%m-%d")
+    headlines = []
+    try:
+        params = {"dataset":"TaiwanStockNews","data_id":sid,
+                  "start_date":start,"end_date":end}
+        if token: params["token"] = token
+        r = requests.get(FINMIND_API, params=params, timeout=15)
+        d = r.json()
+        if d.get("status") == 200 and d.get("data"):
+            df = pd.DataFrame(d["data"])
+            if "title" in df.columns:
+                headlines = df["title"].dropna().tolist()[-10:]
+    except Exception: pass
+
+    if not headlines:
+        return {"score":0.0,"label":"無資料","color":"#5a8fa8",
+                "summary":"","headlines":[],"count":0}
+
+    prompt = f"""以下是台股 {sid} {name} 近期新聞：
+{chr(10).join(['- '+h for h in headlines])}
+
+只回傳 JSON，不加說明：
+{{"score": 0.6, "label": "偏多", "summary": "30字以內摘要"}}
+
+score: 0.8-1.0強多 / 0.4-0.8偏多 / -0.4-0.4中性 / -0.8--0.4偏空 / -1.0--0.8強空"""
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"Content-Type":"application/json"},
+            json={"model":"claude-sonnet-4-20250514","max_tokens":200,
+                  "messages":[{"role":"user","content":prompt}]},
+            timeout=20
+        )
+        text = resp.json()["content"][0]["text"]
+        text = text.replace("```json","").replace("```","").strip()
+        p = json.loads(text)
+        sc = float(p.get("score",0))
+        lbl= p.get("label","中性")
+        clr = ("#00c87a" if sc>0.4 else "#f0c040" if sc>-0.4 else "#ff5c5c")
+        return {"score":sc,"label":lbl,"color":clr,
+                "summary":p.get("summary",""),"headlines":headlines,"count":len(headlines)}
+    except Exception:
+        return {"score":0.0,"label":"分析失敗","color":"#5a8fa8",
+                "summary":"","headlines":headlines,"count":len(headlines)}
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_monthly_revenue(sid: str, token: str = "") -> pd.DataFrame:
     """月營收 YoY 資料"""
