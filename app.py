@@ -816,272 +816,168 @@ def _compat_score(df, mode):
     return {"signal":sig,"score":float(min(100,score)),"reason":"✅ "+" ｜ ".join(pos) if pos else "⬜ 未達條件",
             "breakdown":bd,"warning":""}
 
-#
-# Stage 2 = 股票進入主升段
-# 必要條件：
-#   ① 收盤 > 240MA（年線）
-#   ② 240MA 斜率向上
-#   ③ 120MA > 240MA（中長線多頭排列）
-# 加分項：
-#   RS vs 大盤正值（領先大盤）
-#   收盤距 52 週高點在 5% 以內（強勢）
-#   RSI > 50（動能偏多）
-# 懲罰：跌破 120MA 強制扣分
-
-def score_longterm(df: pd.DataFrame) -> dict:
-    """
-    長線評分（1 年以上持有）
-    參考：Stan Weinstein Stage Analysis
-    滿分 100，買進門檻 60
-    """
-    if len(df) < 240 or "MA240" not in df.columns:
-        return _empty_score("長線", "資料不足（需 240 日以上歷史）")
-
-    last = df.iloc[-1]
-    close   = float(last["Close"])
-
-    def _v(col): return float(last[col]) if not pd.isna(last.get(col)) else np.nan
-
-    ma120 = _v("MA120"); ma240 = _v("MA240")
-    sl240 = _v("MA240_slope"); sl120 = _v("MA120_slope")
-    rs    = _v("RS_3m");   rsi = _v("RSI")
-    pct52 = _v("Pct_from_52H")
-    gain6 = _v("Gain_6m")
-
-    breakdown = []
-    raw = 0.0
-
-    # 必要條件 ① 站上年線 +30
-    c1 = not np.isnan(ma240) and close > ma240
-    pts = 30
-    raw += pts if c1 else 0
-    breakdown.append(("站上 240MA 年線", pts, c1,
-                       f"收 {close:.1f} / 年線 {ma240:.1f}" if not np.isnan(ma240) else "N/A"))
-
-    # 必要條件 ② 年線斜率向上 +25
-    c2 = not np.isnan(sl240) and sl240 > 0
-    pts = 25
-    raw += pts if c2 else 0
-    breakdown.append(("年線（240MA）斜率向上", pts, c2,
-                       f"斜率 {sl240:+.3f}" if not np.isnan(sl240) else "N/A"))
-
-    # 必要條件 ③ 120MA > 240MA（多頭排列）+20
-    c3 = not np.isnan(ma120) and not np.isnan(ma240) and ma120 > ma240
-    pts = 20
-    raw += pts if c3 else 0
-    breakdown.append(("120MA > 240MA（半年線凌駕年線）", pts, c3,
-                       f"120MA {ma120:.1f} / 240MA {ma240:.1f}" if not np.isnan(ma120) else "N/A"))
-
-    # 加分 ④ 相對強度正值（領先大盤）+15
-    c4 = not np.isnan(rs) and rs > 0
-    pts = 15
-    raw += pts if c4 else 0
-    breakdown.append(("RS 相對強度優於大盤", pts, c4,
-                       f"RS {rs*100:+.1f}%" if not np.isnan(rs) else "無大盤資料"))
-
-    # 加分 ⑤ 距 52 週高點 10% 以內（強勢股）+10
-    c5 = not np.isnan(pct52) and pct52 >= -10
-    pts = 10
-    raw += pts if c5 else 0
-    breakdown.append(("距 52 週高點 10% 以內", pts, c5,
-                       f"距高點 {pct52:.1f}%" if not np.isnan(pct52) else "N/A"))
-
-    # 懲罰：跌破 120MA → 長線趨勢動搖 -25
-    below_120 = not np.isnan(ma120) and close < ma120
-    if below_120:
-        raw -= 25
-        breakdown.append(("跌破 120MA 半年線（懲罰）", -25, True,
-                           f"收 {close:.1f} < 半年線 {ma120:.1f}"))
-
-    final = float(max(0.0, min(100.0, raw)))
-    signal = (final >= 60) and c1 and c2 and (not below_120)
-
-    return _build_result("長線", final, signal, breakdown, last)
-
-
-# ── 6-B 中線：CANSLIM 精簡版（O'Neil）────────────────────────
-#
-# N = 新高突破（股價接近 52 週高點）
-# S = 供需（量能放大驗證）
-# L = 領導股（RS 勝大盤）
-# I = 法人認同（用量能趨勢近似）
-# M = 市場方向（大盤 60MA 濾網）
-
-def score_midterm(df: pd.DataFrame) -> dict:
-    """
-    中線評分（6-12 個月持有）
-    參考：William O'Neil CANSLIM
-    滿分 100，買進門檻 55
-    """
-    if len(df) < 65 or "MA60" not in df.columns:
-        return _empty_score("中線", "資料不足（需 65 日以上）")
-
-    last = df.iloc[-1]
-    close = float(last["Close"])
-
-    def _v(col): return float(last[col]) if not pd.isna(last.get(col)) else np.nan
-
-    ma20 = _v("MA20"); ma60 = _v("MA60")
-    sl60 = _v("MA60_slope")
-    rs   = _v("RS_3m"); rsi = _v("RSI")
-    pct52 = _v("Pct_from_52H")
-    gain6 = _v("Gain_6m"); gain1 = _v("Gain_1m")
-    vol   = float(last["Volume"]) if not pd.isna(last.get("Volume")) else 0
-    volma = float(last["VolMA20"]) if not pd.isna(last.get("VolMA20")) else 0
-
-    breakdown = []
-    raw = 0.0
-
-    # N：站上 60MA 季線 +25
-    c1 = not np.isnan(ma60) and close > ma60
-    pts = 25
-    raw += pts if c1 else 0
-    breakdown.append(("站上 60MA 季線（N-新）", pts, c1,
-                       f"收 {close:.1f} / 季線 {ma60:.1f}" if not np.isnan(ma60) else "N/A"))
-
-    # 季線斜率向上 +20
-    c2 = not np.isnan(sl60) and sl60 > 0
-    pts = 20
-    raw += pts if c2 else 0
-    breakdown.append(("季線斜率向上（趨勢確立）", pts, c2,
-                       f"斜率 {sl60:+.3f}" if not np.isnan(sl60) else "N/A"))
-
-    # L：RS 相對強度 +20
-    c3 = not np.isnan(rs) and rs > 0
-    pts = 20
-    raw += pts if c3 else 0
-    breakdown.append(("RS 相對強度優於大盤（L-領導）", pts, c3,
-                       f"RS {rs*100:+.1f}%" if not np.isnan(rs) else "無大盤資料"))
-
-    # S：量能 > 均量（需求浮現）+20
-    c4 = volma > 0 and vol > volma * 1.2
-    pts = 20
-    raw += pts if c4 else 0
-    vol_r = vol / volma if volma > 0 else 0
-    breakdown.append((f"量能放大（S-需求，量比 {vol_r:.1f}×）", pts, c4, ""))
-
-    # 站上 20MA +10
-    c5 = not np.isnan(ma20) and close > ma20
-    pts = 10
-    raw += pts if c5 else 0
-    breakdown.append(("站上 20MA 月線", pts, c5,
-                       f"月線 {ma20:.1f}" if not np.isnan(ma20) else "N/A"))
-
-    # 懲罰：跌破 60MA 季線 -30
-    below_60 = not np.isnan(ma60) and close < ma60
-    if below_60:
-        raw -= 30
-        breakdown.append(("跌破 60MA 季線（懲罰）", -30, True, f"收 {close:.1f} < 季線 {ma60:.1f}"))
-
-    final = float(max(0.0, min(100.0, raw)))
-    signal = (final >= 55) and c1 and c2 and (not below_60)
-
-    return _build_result("中線", final, signal, breakdown, last)
-
-
-# ── 6-C 短線：Williams 動能 + RSI/MACD ───────────────────────
-#
-# 參考 Larry Williams「買在力量，賣在強勢」
-# RSI 50-70 甜蜜區（動能健康，未過熱）
-# MACD 金叉或柱狀圖轉正
-# 爆量突破（今日量 > 昨日 × 1.5）
-# 價格 > 20MA（短線趨勢向上）
-
-def score_shortterm(df: pd.DataFrame) -> dict:
-    """
-    短線評分（7 日內進出）
-    參考：Larry Williams Momentum + RSI/MACD
-    滿分 100，買進門檻 60
-    """
-    if len(df) < 26 or "RSI" not in df.columns:
-        return _empty_score("短線", "資料不足（需 26 日以上）")
-
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    close  = float(last["Close"])
-    p_close = float(prev["Close"])
-
-    def _v(col): return float(last[col]) if not pd.isna(last.get(col)) else np.nan
-    def _p(col): return float(prev[col]) if not pd.isna(prev.get(col)) else np.nan
-
-    ma5   = _v("MA5");  ma20 = _v("MA20")
-    rsi   = _v("RSI")
-    macd  = _v("MACD"); macd_s = _v("MACD_signal"); macd_h = _v("MACD_hist")
-    p_macd_h = _p("MACD_hist")
-    bb_pct   = _v("BB_pct")
-
-    vol    = float(last["Volume"]) if not pd.isna(last.get("Volume")) else 0
-    p_vol  = float(prev["Volume"]) if not pd.isna(prev.get("Volume")) else 0
-    vol_r  = vol / p_vol if p_vol > 0 else 0
-
-    breakdown = []
-    raw = 0.0
-
-    # ① RSI 甜蜜區 50-70 +25
-    rsi_ok = not np.isnan(rsi) and 50 <= rsi <= 70
-    pts = 25
-    raw += pts if rsi_ok else 0
-    rsi_lbl = f"RSI={rsi:.1f}（{'✅ 甜蜜區 50-70' if rsi_ok else '⚠️ 偏高' if rsi > 70 else '偏低'}）"
-    breakdown.append((rsi_lbl, pts, rsi_ok, ""))
-
-    # ② MACD 動能向上（柱狀圖 > 0 或剛轉正）+25
-    macd_bull = (not np.isnan(macd_h) and macd_h > 0) or \
-                (not np.isnan(macd_h) and not np.isnan(p_macd_h) and
-                 macd_h > p_macd_h and macd_h > -0.5)
-    pts = 25
-    raw += pts if macd_bull else 0
-    breakdown.append(("MACD 柱狀圖向上（動能偏多）", pts, macd_bull,
-                       f"MACD={macd:.3f}, 訊號線={macd_s:.3f}" if not np.isnan(macd) else "N/A"))
-
-    # ③ 今日量 > 昨日量 1.5× +25
-    vol_surge = vol_r >= 1.5
-    pts = 25
-    raw += pts if vol_surge else 0
-    breakdown.append((f"爆量確認（今日量 {vol_r:.1f}× 昨日）", pts, vol_surge, ""))
-
-    # ④ 站上 5MA + 20MA +15（各 7.5）
-    c5ma  = not np.isnan(ma5)  and close > ma5
-    c20ma = not np.isnan(ma20) and close > ma20
-    pts5 = 8; pts20 = 7
-    raw += pts5  if c5ma  else 0
-    raw += pts20 if c20ma else 0
-    breakdown.append(("站上 5MA（短線多頭）", pts5,  c5ma,  f"5MA={ma5:.1f}"  if not np.isnan(ma5)  else "N/A"))
-    breakdown.append(("站上 20MA（月線支撐）",pts20, c20ma, f"20MA={ma20:.1f}" if not np.isnan(ma20) else "N/A"))
-
-    # ⑤ 當日上漲（動能方向）+5（bonus，不影響 signal）
-    up_day = close > p_close
-    raw += 5 if up_day else 0
-
-    # 懲罰：RSI > 75 過熱 -20
-    overbought = not np.isnan(rsi) and rsi > 75
-    if overbought:
-        raw -= 20
-        breakdown.append(("RSI 過熱 > 75（懲罰，追高風險）", -20, True, f"RSI={rsi:.1f}"))
-
 
 # ════════════════════════════════════════════════════════════════
-# ⑦ 改良版買賣建議（Van Tharp ATR × Fibonacci 雙驗證）
+# ⑦ 買賣建議價位（三模式差異化進場邏輯）
 # ════════════════════════════════════════════════════════════════
-#
-# 核心改良：RR 從「進場價（entry price）」計算，不從現價算
-#   進場價  = 建議買進區間中點
-#   停損    = 進場價 - 1.5×ATR（短線）/ 2.0×ATR（中長線）
-#   目標一  = 進場價 + 2.0×ATR（RR ≥ 1:1.3）
-#   目標二  = 前高阻力 × 98%（Fibonacci 61.8% 或前高）
-#   最終 RR = (目標一 - 進場) / (進場 - 停損)
 
 def compute_trade_zones(df: pd.DataFrame, mode: str = "short") -> dict:
+    """
+    買賣建議價位計算。
+
+    核心原則：進場區必須貼近現價，RR 從進場價計算。
+
+    短線 → 現在就能進場（追動能型），停損 1.5×ATR
+    中線 → 等小回 3-5%（不用等 MA20），停損 MA20 下方
+    長線 → 等回踩均線（MA60 附近），停損 MA60 下方
+
+    Parameters
+    ----------
+    df   : 含指標的 DataFrame
+    mode : "short" / "mid" / "long"
+    """
     if len(df) < 20:
         return {}
 
-    last   = df.iloc[-1]
-    close  = float(last["Close"])
-    atr    = float(last["ATR"])  if not pd.isna(last.get("ATR"))  else close * 0.02
-    ma20   = float(last["MA20"]) if not pd.isna(last.get("MA20")) else close
-    ma60   = float(last["MA60"]) if not pd.isna(last.get("MA60")) else close
-    ma120  = float(last["MA120"])if not pd.isna(last.get("MA120")) else close
-    ma240  = float(last["MA240"])if not pd.isna(last.get("MA240")) else close
-    hi52w  = float(last["High52W"]) if not pd.isna(last.get("High52W")) else close * 1.15
+    last  = df.iloc[-1]
+    prev  = df.iloc[-2] if len(df) >= 2 else last
+    close = float(last["Close"])
+
+    def _v(col, fallback=None):
+        v = last.get(col)
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return fallback if fallback is not None else close
+        return float(v)
+
+    atr   = _v("ATR",   close * 0.025)
+    ma5   = _v("MA5",   close)
+    ma20  = _v("MA20",  close)
+    ma60  = _v("MA60",  close)
+    ma120 = _v("MA120", close)
+    hi52w = _v("High52W", close * 1.15)
+    lo52w = _v("Low52W",  close * 0.85)
+
+    # 近 20 日最高點（短線前高）
+    hi20 = float(df["High"].tail(20).max()) if "High" in df.columns else close * 1.05
+    lo10 = float(df["Low"].tail(10).min())  if "Low"  in df.columns else close * 0.95
+
+    # Fibonacci 延伸（52W 低→高）
+    fib_range = max(hi52w - lo52w, atr * 5)
+    fib_ext   = hi52w + fib_range * 0.618
+
+    # ══════════════════════════════════════════════
+    # 短線（7日）：追動能，現在就能進場
+    # 參考：Minervini "買在突破當下"
+    # 進場A（突破型）：現價 + 0.5%（確認向上一點就買）
+    # 進場B（當日回）：今日開盤 ~ 現價之間的回踩
+    # 停損：現價 - 1.5×ATR（快速停損）
+    # 目標：以進場A計算，ATR 倍數目標
+    # ══════════════════════════════════════════════
+    if mode == "short":
+        # 進場：現在就能買，不需等均線回踩
+        entry_a = round(close * 1.005, 1)          # 突破型：現價 +0.5%
+        entry_b = round(close * 0.985, 1)          # 回踩型：現價 -1.5%（小回就買）
+        entry_mid = entry_a                         # RR 以突破型為基準
+
+        # 停損：現價下方 1.5×ATR，並參考近 10 日低點
+        stop_atr  = round(close - 1.5 * atr, 1)
+        stop_lo10 = round(lo10 * 0.995, 1)
+        stop_loss = round(max(stop_atr, stop_lo10), 1)  # 取較高（較緊）
+
+        # 目標：ATR 倍數，並參考近 20 日前高
+        target1 = round(close + 2.0 * atr, 1)
+        target2 = round(max(close + 3.5 * atr, hi20 * 0.99), 1)
+
+        entry_note = "✅ 現在即可進場（突破型），或等小回 -1.5% 再買（回踩型）"
+        stop_note  = f"快速停損：跌破現價 -{(close - stop_loss)/close*100:.1f}%（1.5×ATR）"
+
+    # ══════════════════════════════════════════════
+    # 中線（6-12M）：等小回，不用等 MA20
+    # 進場A：現價 -3%（正常小回）
+    # 進場B：現價 -6%（較深回踩，可加碼）
+    # 停損：MA20 下方 2%
+    # 目標：MA60 斜率 × 持有天數，或 Fibonacci
+    # ══════════════════════════════════════════════
+    elif mode == "mid":
+        # 判斷現價離 MA20 的距離
+        gap_to_ma20 = (close - ma20) / ma20 * 100
+
+        if gap_to_ma20 <= 5:
+            # 現價已在 MA20 附近（5%以內）→ 直接買
+            entry_a   = round(close * 1.003, 1)
+            entry_b   = round(ma20 * 1.005, 1)
+            entry_note= "✅ 現價已接近月線，可直接進場"
+        elif gap_to_ma20 <= 12:
+            # 小幅偏高 → 等 3-5% 小回
+            entry_a   = round(close * 0.97, 1)
+            entry_b   = round(close * 0.94, 1)
+            entry_note= f"⏳ 現價高於月線 {gap_to_ma20:.1f}%，等小回 3-5% 再進場"
+        else:
+            # 偏高較多 → 分兩批：現在買一點，等回再加碼
+            entry_a   = round(close * 1.003, 1)   # 試單
+            entry_b   = round(close * 0.92, 1)    # 等回加碼
+            entry_note= f"⚠️ 現價高於月線 {gap_to_ma20:.1f}%，建議先試單 1/3，等回踩加碼"
+
+        entry_mid = entry_a
+        stop_loss = round(ma20 * 0.97, 1)    # MA20 下方 3%
+        target1   = round(entry_a + 3.0 * atr, 1)
+        target2   = round(min(hi52w * 0.97, fib_ext), 1)
+        stop_note = f"跌破月線 MA20（{ma20:.1f}）下方 3% → 停損"
+
+    # ══════════════════════════════════════════════
+    # 長線（1年+）：等回踩均線附近
+    # 進場：MA60 附近（季線支撐）
+    # 停損：MA120 下方
+    # 目標：Fibonacci 延伸
+    # ══════════════════════════════════════════════
+    else:
+        gap_to_ma60 = (close - ma60) / ma60 * 100
+
+        if gap_to_ma60 <= 8:
+            entry_a   = round(close * 1.003, 1)
+            entry_b   = round(ma60 * 1.005, 1)
+            entry_note= "✅ 現價已接近季線，可進場"
+        else:
+            entry_a   = round(ma60 * 1.01, 1)
+            entry_b   = round(ma60 * 0.99, 1)
+            entry_note= f"⏳ 現價高於季線 {gap_to_ma60:.1f}%，等回踩季線附近"
+
+        entry_mid = entry_a
+        stop_loss = round(ma120 * 0.975, 1)
+        target1   = round(entry_a + 4.0 * atr, 1)
+        target2   = round(fib_ext, 1)
+        stop_note = f"跌破半年線 MA120（{ma120:.1f}）下方 2.5% → 停損"
+
+    # ── 共同：計算 RR（從進場A計算）──────────────────────
+    risk   = max(entry_mid - stop_loss, atr * 0.3)
+    reward = target1 - entry_mid
+    rr     = round(reward / risk, 2) if risk > 0 else 0.0
+
+    # ── 現在能不能立刻進場 ────────────────────────────────
+    if mode == "short":
+        can_enter_now = True   # 短線永遠可以現在進場
+    elif mode == "mid":
+        can_enter_now = close <= entry_a * 1.03
+    else:
+        can_enter_now = close <= entry_a * 1.05
+
+    return {
+        "entry_a":      entry_a,          # 主要進場價（突破型 or 直接買）
+        "entry_b":      entry_b,          # 備用進場價（回踩加碼）
+        "entry_mid":    entry_mid,        # RR 計算基準
+        "stop_loss":    stop_loss,
+        "target1":      target1,
+        "target2":      target2,
+        "risk_reward":  rr,
+        "atr":          round(atr, 2),
+        "stop_note":    stop_note,
+        "entry_note":   entry_note,
+        "can_enter_now":can_enter_now,
+        "close":        close,
+        # 舊版相容欄位
+        "entry_low":    min(entry_a, entry_b),
+        "entry_high":   max(entry_a, entry_b),
+    }
     lo52w  = float(last["Low52W"])  if not pd.isna(last.get("Low52W"))  else close * 0.85
 
     # Fibonacci 延伸（從 52 週低點到 52 週高點）
