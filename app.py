@@ -411,6 +411,335 @@ def fetch_monthly_revenue(sid: str, token: str = "") -> pd.DataFrame:
         return pd.DataFrame()
 
 
+
+# ════════════════════════════════════════════════════════════════
+# ⑤-c  三大法人買賣超（外資／投信／自營商）
+# ════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_institutional(sid: str, token: str = "") -> pd.DataFrame:
+    """
+    FinMind TaiwanStockInstitutionalInvestors
+    欄位：date / Foreign_Investors_buy / Foreign_Investors_sell
+          Investment_Trust_buy / Investment_Trust_sell
+          Dealer_buy / Dealer_sell
+    回傳統整後的 DataFrame，含每日淨買超金額
+    """
+    end   = datetime.today().strftime("%Y-%m-%d")
+    start = (datetime.today() - timedelta(days=60)).strftime("%Y-%m-%d")
+    params = {"dataset": "TaiwanStockInstitutionalInvestors",
+              "data_id": sid, "start_date": start, "end_date": end}
+    if token: params["token"] = token
+    try:
+        r = requests.get(FINMIND_API, params=params, timeout=15)
+        d = r.json()
+        if d.get("status") != 200 or not d.get("data"):
+            return pd.DataFrame()
+        df = pd.DataFrame(d["data"])
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date").reset_index(drop=True)
+
+        # FinMind 回傳格式：name 欄位標示法人類型，buy/sell 欄位
+        # 先 pivot 成寬表
+        if "name" in df.columns and "buy" in df.columns:
+            df["net"] = pd.to_numeric(df["buy"], errors="coerce").fillna(0) - \
+                        pd.to_numeric(df["sell"], errors="coerce").fillna(0)
+            pivot = df.pivot_table(index="date", columns="name",
+                                   values="net", aggfunc="sum").reset_index()
+            # 統一欄位名稱
+            rename = {}
+            for col in pivot.columns:
+                if "外資" in str(col) or "Foreign" in str(col):
+                    rename[col] = "外資淨買"
+                elif "投信" in str(col) or "Investment_Trust" in str(col):
+                    rename[col] = "投信淨買"
+                elif "自營" in str(col) or "Dealer" in str(col):
+                    rename[col] = "自營淨買"
+            pivot = pivot.rename(columns=rename)
+            for col in ["外資淨買", "投信淨買", "自營淨買"]:
+                if col not in pivot.columns:
+                    pivot[col] = 0.0
+            return pivot
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_margin(sid: str, token: str = "") -> pd.DataFrame:
+    """
+    FinMind TaiwanStockMarginPurchaseShortSale
+    融資餘額（MarginPurchase_TodayBalance）
+    融券餘額（ShortSale_TodayBalance）
+    """
+    end   = datetime.today().strftime("%Y-%m-%d")
+    start = (datetime.today() - timedelta(days=60)).strftime("%Y-%m-%d")
+    params = {"dataset": "TaiwanStockMarginPurchaseShortSale",
+              "data_id": sid, "start_date": start, "end_date": end}
+    if token: params["token"] = token
+    try:
+        r = requests.get(FINMIND_API, params=params, timeout=15)
+        d = r.json()
+        if d.get("status") != 200 or not d.get("data"):
+            return pd.DataFrame()
+        df = pd.DataFrame(d["data"])
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date").reset_index(drop=True)
+        for col in df.columns:
+            if col != "date":
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=7200, show_spinner=False)
+def fetch_news_and_sentiment(sid: str, name: str, token: str = "") -> dict:
+    """
+    抓取個股新聞，並用 Claude API 做情緒分析。
+    回傳：{sentiment_score(-1~1), headlines, summary, news_count}
+    """
+    # Step 1：嘗試 FinMind 新聞
+    end   = datetime.today().strftime("%Y-%m-%d")
+    start = (datetime.today() - timedelta(days=14)).strftime("%Y-%m-%d")
+    headlines = []
+    try:
+        params = {"dataset": "TaiwanStockNews", "data_id": sid,
+                  "start_date": start, "end_date": end}
+        if token: params["token"] = token
+        r = requests.get(FINMIND_API, params=params, timeout=15)
+        d = r.json()
+        if d.get("status") == 200 and d.get("data"):
+            news_df = pd.DataFrame(d["data"])
+            if "title" in news_df.columns:
+                headlines = news_df["title"].dropna().tolist()[-10:]
+    except Exception:
+        pass
+
+    if not headlines:
+        return {"sentiment_score": 0.0, "headlines": [],
+                "summary": "無新聞資料", "news_count": 0,
+                "label": "中性", "label_color": "#5a8fa8"}
+
+    # Step 2：用 Claude API 做情緒分析
+    news_text = "\n".join([f"- {h}" for h in headlines])
+    prompt = f"""以下是台股 {sid} {name} 近期的新聞標題：
+
+{news_text}
+
+請以台灣股市投資角度，分析這些新聞對股價的整體影響。
+請只回傳 JSON，格式如下，不要加任何說明文字：
+{{
+  "sentiment_score": 0.65,
+  "label": "偏多",
+  "summary": "近期新聞主要反映...(30字以內的摘要)",
+  "key_points": ["重點1", "重點2"]
+}}
+
+sentiment_score 說明：
+  0.8~1.0 = 強力多頭（重大利多，業績爆發）
+  0.5~0.8 = 偏多（正面消息，法說會正向）
+  0.2~0.5 = 略偏多（中性偏正）
+  -0.2~0.2 = 中性
+  -0.5~-0.2 = 略偏空
+  -0.8~-0.5 = 偏空（負面消息，法說下修）
+  -1.0~-0.8 = 強力空頭（重大利空）"""
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"Content-Type": "application/json"},
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 400,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=20
+        )
+        result = resp.json()
+        text = result.get("content", [{}])[0].get("text", "{}")
+        # 清除 markdown code block
+        text = text.replace("```json", "").replace("```", "").strip()
+        parsed = __import__("json").loads(text)
+        score  = float(parsed.get("sentiment_score", 0.0))
+        label  = parsed.get("label", "中性")
+        summary= parsed.get("summary", "")
+
+        # 顏色
+        if score >= 0.5:
+            lc = "#00c87a"
+        elif score >= 0.2:
+            lc = "#80d840"
+        elif score >= -0.2:
+            lc = "#f0c040"
+        elif score >= -0.5:
+            lc = "#f0a500"
+        else:
+            lc = "#ff5c5c"
+
+        return {
+            "sentiment_score": score,
+            "headlines":       headlines,
+            "summary":         summary,
+            "news_count":      len(headlines),
+            "label":           label,
+            "label_color":     lc,
+            "key_points":      parsed.get("key_points", []),
+        }
+    except Exception:
+        return {"sentiment_score": 0.0, "headlines": headlines,
+                "summary": "情緒分析失敗", "news_count": len(headlines),
+                "label": "中性", "label_color": "#5a8fa8"}
+
+
+# ════════════════════════════════════════════════════════════════
+# ⑤-d  籌碼面評分（Chip Flow Score）
+# ════════════════════════════════════════════════════════════════
+#
+#  評分邏輯（最高 30 分，整合進 GPS 總分）：
+#
+#  C1  外資連續買超（近 5 日）     +10  外資是台股最大法人
+#  C2  投信買超（近 5 日正值）      +8   投信是長線護盤主力
+#  C3  自營商配合買超               +4   三方共識，信號最強
+#  C4  融資比例合理（未爆量）        +8   融資過多代表散戶過熱
+#
+#  死亡過濾：
+#    外資連 10 日大幅賣超           -15  外資出貨，最危險訊號
+#    融資急增（暴增 20% 以上）       -10  過熱，接近崩跌
+# ════════════════════════════════════════════════════════════════
+
+def score_chipflow(inst_df: pd.DataFrame, margin_df: pd.DataFrame,
+                   news_data: dict = None) -> dict:
+    """
+    籌碼面 + 新聞情緒評分。
+    回傳 {score, breakdown, net_foreign_5d, net_trust_5d, margin_ratio, news_score}
+    """
+    bd  = []
+    raw = 0.0
+
+    # ── 三大法人分析 ────────────────────────────────────────
+    foreign_5d = 0.0
+    trust_5d   = 0.0
+    dealer_5d  = 0.0
+
+    if not inst_df.empty and len(inst_df) >= 3:
+        tail = inst_df.tail(5)
+        for col, var_name in [("外資淨買", "foreign"), ("投信淨買", "trust"), ("自營淨買", "dealer")]:
+            if col in tail.columns:
+                val = float(tail[col].fillna(0).sum())
+                if var_name == "foreign": foreign_5d = val
+                elif var_name == "trust": trust_5d   = val
+                else:                    dealer_5d  = val
+
+        # 外資連買（5日淨買超為正）
+        c1 = foreign_5d > 0
+        pts = 10
+        raw += pts if c1 else 0
+        bd.append({
+            "stage":"C", "label":"外資近5日淨買超",
+            "pts":pts, "met":c1,
+            "detail": f"外資 5日淨：{foreign_5d/1e8:+.2f} 億" if foreign_5d else "無資料",
+        })
+
+        # 投信買超
+        c2 = trust_5d > 0
+        pts = 8
+        raw += pts if c2 else 0
+        bd.append({
+            "stage":"C", "label":"投信近5日買超",
+            "pts":pts, "met":c2,
+            "detail": f"投信 5日淨：{trust_5d/1e6:+.0f} 張" if trust_5d else "無資料",
+        })
+
+        # 三方共識（外資+投信同向買超）
+        c3 = foreign_5d > 0 and trust_5d > 0
+        pts = 4
+        raw += pts if c3 else 0
+        bd.append({
+            "stage":"C", "label":"外資+投信同向買超（三方共識）",
+            "pts":pts, "met":c3, "detail":"",
+        })
+
+        # 外資大幅賣超懲罰（連10日查詢不到，改用5日深度賣超判斷）
+        if not inst_df.empty and len(inst_df) >= 5:
+            tail10 = inst_df.tail(5)
+            foreign_5d_all = float(tail10.get("外資淨買", pd.Series([0])).fillna(0).sum())
+            if foreign_5d_all < -5e8:   # 5日賣超超過 5 億
+                raw -= 15
+                bd.append({
+                    "stage":"C", "label":"⚠️ 外資大幅賣超（死亡過濾）",
+                    "pts":-15, "met":True,
+                    "detail":f"外資5日賣超 {abs(foreign_5d_all)/1e8:.1f} 億，風險極高",
+                })
+    else:
+        bd.append({
+            "stage":"C", "label":"三大法人資料無法取得",
+            "pts":0, "met":False, "detail":"需 FinMind Token 或資料延遲",
+        })
+
+    # ── 融資融券分析 ──────────────────────────────────────────
+    margin_ratio = 0.0
+    if not margin_df.empty:
+        # 尋找融資餘額欄位
+        margin_col = None
+        for col in margin_df.columns:
+            if "MarginPurchase" in str(col) and "Balance" in str(col):
+                margin_col = col
+                break
+        if margin_col and len(margin_df) >= 10:
+            latest = float(margin_df[margin_col].iloc[-1])
+            week_ago = float(margin_df[margin_col].iloc[-6]) if len(margin_df) >= 6 else latest
+            margin_change = (latest - week_ago) / (week_ago + 1) * 100
+
+            # 融資比例合理（未急增）
+            c4 = margin_change < 20
+            pts = 8
+            raw += pts if c4 else 0
+            margin_ratio = margin_change
+            bd.append({
+                "stage":"C", "label":f"融資比例合理（週變化 {margin_change:+.1f}%）",
+                "pts":pts, "met":c4,
+                "detail": "融資未暴增，籌碼乾淨" if c4 else "⚠️ 融資急增，散戶過熱",
+            })
+
+            # 融資暴增懲罰
+            if margin_change > 20:
+                raw -= 10
+                bd.append({
+                    "stage":"C", "label":"⚠️ 融資暴增（死亡過濾）",
+                    "pts":-10, "met":True,
+                    "detail":f"融資週增 {margin_change:.1f}%，接近崩跌前特徵",
+                })
+
+    # ── 新聞情緒分數（最高 +5，算入總分）─────────────────────
+    news_score = 0.0
+    if news_data and news_data.get("news_count", 0) > 0:
+        raw_news = float(news_data.get("sentiment_score", 0.0))
+        # 將 -1~1 映射到 -5~+5 分
+        news_pts  = round(raw_news * 5, 1)
+        news_score = news_pts
+        raw += news_pts
+        bd.append({
+            "stage":"C",
+            "label": f"新聞情緒：{news_data.get('label','中性')}（{news_pts:+.1f}分）",
+            "pts":   int(news_pts),
+            "met":   news_pts > 0,
+            "detail":news_data.get("summary",""),
+        })
+
+    final = float(max(-30.0, min(30.0, raw)))   # 籌碼面 -30 到 +30
+
+    return {
+        "score":          final,
+        "breakdown":      bd,
+        "net_foreign_5d": foreign_5d,
+        "net_trust_5d":   trust_5d,
+        "net_dealer_5d":  dealer_5d,
+        "margin_ratio":   margin_ratio,
+        "news_score":     news_score,
+    }
+
+
 # ════════════════════════════════════════════════════════════════
 # ⑥  G.P.S. 全方位選股評分系統
 # ════════════════════════════════════════════════════════════════
@@ -419,10 +748,11 @@ def fetch_monthly_revenue(sid: str, token: str = "") -> pd.DataFrame:
 #  參考：科斯托蘭尼、巴菲特、Mgk、蔣承翰、川銀藏
 #
 #  ┌──────────────────────────────────────────────────────────┐
-#  │  Stage 1  Global Market  大盤環境      20 分             │
-#  │  Stage 2  Peer Group     族群動能      25 分             │
-#  │  Stage 3  Stock Tech     個股強勢度    35 分             │
-#  │  Stage 4  Fundamental    護城河與未來  20 分             │
+#  │  Stage G  Global Market  大盤環境      20 分             │
+#  │  Stage P  Peer Group     族群動能      20 分             │
+#  │  Stage S  Stock Tech     個股強勢度    30 分             │
+#  │  Stage F  Fundamental    護城河與未來  15 分             │
+#  │  Stage C  Chip Flow      籌碼+新聞     15 分             │
 #  │  ───────────────────────────────────────────────        │
 #  │  死亡過濾  大盤跌破 60MA             −40 分             │
 #  │  滿分                               100 分             │
@@ -452,17 +782,11 @@ def score_gps(
     sector_stats: dict,
     rev_df: pd.DataFrame = None,
     sid: str = "",
+    chip_data: dict = None,      # ← 籌碼面數據（score_chipflow 回傳）
 ) -> dict:
     """
     G.P.S. 全方位選股評分（100 分制）。
-
-    Parameters
-    ----------
-    df           : 個股含指標的 DataFrame
-    market_data  : get_market_state() 回傳的大盤狀態
-    sector_stats : compute_sector_stats() 回傳的族群資料
-    rev_df       : fetch_monthly_revenue() 回傳的月營收資料（可為 None）
-    sid          : 股票代號（用於護城河判斷）
+    Stage G(20) + P(20) + S(30) + F(15) + C(15) = 100
     """
     if len(df) < 20:
         return _gps_empty("資料不足")
@@ -524,9 +848,9 @@ def score_gps(
     sector_strong_cnt= sector_stats.get("strong_count", 0)    # 上漲 >3% 的檔數
     sector_vol_rank  = sector_stats.get("vol_rank", 99)        # 成交值排名（越小越好）
 
-    # P1：龍頭帶領（族群 2 檔以上強勢，或平均漲幅 >3%）+15
+    # P1：龍頭帶領（族群 2 檔以上強勢，或平均漲幅 >3%）+12
     p1_ok = sector_strong_cnt >= 2 or sector_avg_chg > 3.0
-    pts = 15
+    pts = 12
     raw += pts if p1_ok else 0
     breakdown.append({
         "stage": "P", "label": "族群龍頭帶領（≥2檔強勢 或 均漲>3%）",
@@ -534,9 +858,9 @@ def score_gps(
         "detail": f"族群平均漲 {sector_avg_chg:+.1f}%，強勢股 {sector_strong_cnt} 檔",
     })
 
-    # P2：資金匯集（族群成交值排名前 5）+10
+    # P2：資金匯集（族群成交值排名前 5）+8
     p2_ok = sector_vol_rank <= 5
-    pts = 10
+    pts = 8
     raw += pts if p2_ok else 0
     breakdown.append({
         "stage": "P", "label": "族群成交值前 5（資金匯集）",
@@ -545,13 +869,13 @@ def score_gps(
     })
 
     # ════════════════════════════════════════
-    # Stage 3：Stock Technical 個股強勢度（35分）
+    # Stage S：Stock Technical 個股強勢度（30分）
     # ════════════════════════════════════════
 
-    # S1：相對強度 RS（大盤跌它不跌，或創高）+15
+    # S1：相對強度 RS（大盤跌它不跌，或創高）+12
     rs_3m = _v("RS_3m")
     s1_ok = not np.isnan(rs_3m) and rs_3m > 0
-    pts = 15
+    pts = 12
     raw += pts if s1_ok else 0
     breakdown.append({
         "stage": "S", "label": "相對強度 RS 優於大盤",
@@ -563,7 +887,6 @@ def score_gps(
     vol_today  = float(last.get("Volume", 0))
     vol_5d     = float(df["Volume"].tail(6).iloc[:-1].mean()) if len(df) >= 6 else 0
     vol_burst  = vol_5d > 0 and vol_today > vol_5d * 1.5
-    # 收在振幅前 1/3：(Close - Low) / (High - Low) > 2/3
     hi = float(last.get("High", close)); lo = float(last.get("Low", close))
     range_pos  = (close - lo) / (hi - lo) if (hi - lo) > 0 else 0.5
     s2_ok = vol_burst and range_pos > 0.667
@@ -576,11 +899,11 @@ def score_gps(
                    if vol_5d > 0 else "成交量資料不足"),
     })
 
-    # S3：均線多頭排列 MA5>MA10>MA20>MA60 +10
+    # S3：均線多頭排列 MA5>MA10>MA20>MA60 +8
     ma5 = _v("MA5"); ma10 = _v("MA10"); ma20 = _v("MA20"); ma60 = _v("MA60")
     s3_ok = (not any(np.isnan(x) for x in [ma5,ma10,ma20,ma60]) and
              ma5 > ma10 > ma20 > ma60)
-    pts = 10
+    pts = 8
     raw += pts if s3_ok else 0
     breakdown.append({
         "stage": "S", "label": "均線多頭排列（MA5>MA10>MA20>MA60）",
@@ -590,23 +913,22 @@ def score_gps(
     })
 
     # ════════════════════════════════════════
-    # Stage 4：Fundamental 護城河與未來（20分）
+    # Stage F：Fundamental 護城河與未來（15分）
     # ════════════════════════════════════════
 
-    # F1：近一季營收 YoY > 20% +10
+    # F1：近一季營收 YoY > 20% +8
     f1_ok = False
     f1_detail = "月營收資料無法取得"
     if rev_df is not None and len(rev_df) >= 14:
         try:
-            # 取最新月份 vs 去年同月
             latest    = rev_df.iloc[-1]["revenue"]
-            year_ago  = rev_df.iloc[-13]["revenue"]   # 往前推 12 個月
+            year_ago  = rev_df.iloc[-13]["revenue"]
             yoy       = (latest - year_ago) / year_ago * 100 if year_ago > 0 else 0
             f1_ok     = yoy > 20
             f1_detail = f"最新月營收 YoY = {yoy:+.1f}%（需>20%）"
         except Exception:
             f1_detail = "YoY 計算失敗（資料不足）"
-    pts = 10
+    pts = 8
     raw += pts if f1_ok else 0
     breakdown.append({
         "stage": "F", "label": "近一季月營收 YoY > 20%",
@@ -614,22 +936,48 @@ def score_gps(
         "detail": f1_detail,
     })
 
-    # F2：具備護城河（護城河清單 or 毛利率提升）+10
+    # F2：具備護城河（護城河清單 or RS 極強）+7
     is_moat = sid in MOAT_STOCKS
-    f2_ok = is_moat   # 基礎：在已知護城河清單中
+    f2_ok = is_moat
     f2_detail = ("已知護城河企業（寡占 / 技術領先 / 品牌壟斷）"
                  if is_moat else "非護城河清單，暫以 RS 代替")
-    # 若不在護城河清單，但 RS 非常強（>10%），給予部分認可
     if not is_moat and not np.isnan(rs_3m) and rs_3m > 0.10:
         f2_ok = True
-        f2_detail = f"非護城河清單，但 RS 極強（+{rs_3m*100:.1f}%），視為市場認可"
-    pts = 10
+        f2_detail = f"RS 極強（+{rs_3m*100:.1f}%），視為市場認可"
+    pts = 7
     raw += pts if f2_ok else 0
     breakdown.append({
         "stage": "F", "label": "具備護城河（寡占／技術領先／品牌）",
         "pts": pts, "met": f2_ok,
         "detail": f2_detail,
     })
+
+    # ════════════════════════════════════════
+    # Stage C：Chip Flow 籌碼面 + 新聞（15分）
+    # ════════════════════════════════════════
+
+    chip_score = 0.0
+    if chip_data is not None:
+        # 籌碼評分（-30~+30）→ 映射到 GPS 的 -15~+15
+        chip_raw  = float(chip_data.get("score", 0.0))
+        chip_pts  = round(chip_raw * 0.5, 1)   # 縮放到 ±15
+        chip_score = chip_pts
+        raw += chip_pts
+        # 把籌碼明細加入 breakdown
+        for b in chip_data.get("breakdown", []):
+            scaled_pts = round(b["pts"] * 0.5, 0)
+            breakdown.append({
+                "stage": "C",
+                "label": b["label"],
+                "pts":   int(scaled_pts),
+                "met":   b["met"],
+                "detail":b.get("detail",""),
+            })
+    else:
+        breakdown.append({
+            "stage":"C","label":"籌碼資料尚未載入",
+            "pts":0,"met":False,"detail":"掃描時自動取得",
+        })
 
     # ── 最終計算 ─────────────────────────────────────────────
     final = float(max(0.0, min(100.0, raw)))
@@ -678,11 +1026,11 @@ def score_gps(
         "warning":     warning,
         "breakdown":   breakdown,
         "death_trigger": death_trigger,
-        # 各階段分數（用於雷達圖/明細）
-        "score_G": sum(b["pts"] for b in breakdown if b["stage"]=="G" and b["met"]),
-        "score_P": sum(b["pts"] for b in breakdown if b["stage"]=="P" and b["met"]),
-        "score_S": sum(b["pts"] for b in breakdown if b["stage"]=="S" and b["met"]),
-        "score_F": sum(b["pts"] for b in breakdown if b["stage"]=="F" and b["met"]),
+        "score_G": sum(b["pts"] for b in breakdown if b["stage"]=="G" and b["met"] and b["pts"]>0),
+        "score_P": sum(b["pts"] for b in breakdown if b["stage"]=="P" and b["met"] and b["pts"]>0),
+        "score_S": sum(b["pts"] for b in breakdown if b["stage"]=="S" and b["met"] and b["pts"]>0),
+        "score_F": sum(b["pts"] for b in breakdown if b["stage"]=="F" and b["met"] and b["pts"]>0),
+        "score_C": round(chip_score, 1),
     }
 
 
@@ -692,7 +1040,7 @@ def _gps_empty(reason: str = "") -> dict:
         "grade_action":"無法評分","grade_color":"#ff5c5c",
         "reason":reason,"warning":reason,"breakdown":[],
         "death_trigger":False,
-        "score_G":0,"score_P":0,"score_S":0,"score_F":0,
+        "score_G":0,"score_P":0,"score_S":0,"score_F":0,"score_C":0,
     }
 
 
@@ -1165,7 +1513,14 @@ def scan_sector(sector: str, token: str, taiex_df: pd.DataFrame,
         rev_df  = fetch_monthly_revenue(sid, token)
         sec_st  = sector_stats.get(sector, {"avg_chg":0,"strong_count":0,"vol_rank":99})
 
-        gps   = score_gps(df, market_data, sec_st, rev_df, sid)
+        # 籌碼面：三大法人 + 融資 + 新聞情緒
+        inst_df  = fetch_institutional(sid, token)
+        margin_df= fetch_margin(sid, token)
+        name_str = STOCK_NAMES.get(sid, sid)
+        news_data= fetch_news_and_sentiment(sid, name_str, token)
+        chip_d   = score_chipflow(inst_df, margin_df, news_data)
+
+        gps   = score_gps(df, market_data, sec_st, rev_df, sid, chip_data=chip_d)
 
         # 低分跳過（門檻依模式調整）
         min_threshold = {"short": 45, "mid": 45, "long": 40}[scan_mode]
@@ -1197,6 +1552,10 @@ def scan_sector(sector: str, token: str, taiex_df: pd.DataFrame,
             "P分":        gps["score_P"],
             "S分":        gps["score_S"],
             "F分":        gps["score_F"],
+            "C分":        gps.get("score_C", 0),
+            "外資5日":    round(chip_d.get("net_foreign_5d", 0) / 1e8, 2),
+            "投信5日":    round(chip_d.get("net_trust_5d",   0) / 1e6, 0),
+            "新聞情緒":   news_data.get("label", "—") if news_data else "—",
             "回測報酬%":  bt["return"],
             "勝率%":      bt["win_rate"],
             "MDD%":       bt["mdd"],
@@ -1486,11 +1845,13 @@ def render_card(row: dict | pd.Series) -> str:
     ret_c   = "#00c87a" if ret >= 0 else "#ff5c5c"
     ret_sym = "+" if ret >= 0 else ""
 
-    # GPS 四階段分數條
+    # GPS 五階段分數條
     sg = float(row.get("G分", 0)); sp = float(row.get("P分", 0))
     ss = float(row.get("S分", 0)); sf = float(row.get("F分", 0))
+    sc_chip = float(row.get("C分", 0))
+
     def _seg(val, mx, clr, lbl):
-        pct = min(val / mx * 100, 100)
+        pct = max(0, min(val / max(mx, 1) * 100, 100))
         return (f'<div style="flex:1;margin:0 2px;">'
                 f'<div style="font-size:0.58rem;color:#3a6a8a;margin-bottom:2px;">{lbl}</div>'
                 f'<div style="background:#0e2030;border-radius:3px;height:5px;">'
@@ -1501,11 +1862,32 @@ def render_card(row: dict | pd.Series) -> str:
     stage_bars = (
         f'<div style="display:flex;margin:6px 0 10px;gap:2px;">'
         f'{_seg(sg,20,"#4ab3ff","G大盤")}'
-        f'{_seg(sp,25,"#c084fc","P族群")}'
-        f'{_seg(ss,35,"#f0c040","S個股")}'
-        f'{_seg(sf,20,"#00c87a","F基本面")}'
+        f'{_seg(sp,20,"#c084fc","P族群")}'
+        f'{_seg(ss,30,"#f0c040","S個股")}'
+        f'{_seg(sf,15,"#00c87a","F基本")}'
+        f'{_seg(max(sc_chip,0),15,"#ff9060","C籌碼")}'
         f'</div>'
     )
+
+    # 新聞情緒顯示
+    news_lbl   = str(row.get("新聞情緒",""))
+    foreign_5d = float(row.get("外資5日", 0))
+    trust_5d   = float(row.get("投信5日", 0))
+    chip_html  = ""
+    if news_lbl or foreign_5d or trust_5d:
+        f_color = "#00c87a" if foreign_5d > 0 else "#ff5c5c"
+        t_color = "#00c87a" if trust_5d   > 0 else "#ff5c5c"
+        chip_html = (
+            f'<div style="background:#060f1c;border:1px solid #1a3050;border-radius:6px;'
+            f'padding:6px 10px;margin-top:6px;font-size:0.7rem;display:flex;gap:12px;flex-wrap:wrap;">'
+            f'<span style="color:#3a6a8a;">外資</span>'
+            f'<span style="color:{f_color};font-family:monospace;">{foreign_5d:+.2f}億</span>'
+            f'<span style="color:#3a6a8a;">投信</span>'
+            f'<span style="color:{t_color};font-family:monospace;">{trust_5d:+.0f}張</span>'
+            + (f'<span style="color:#5a8aa8;">新聞</span>'
+               f'<span style="color:#c8d8e8;">{news_lbl}</span>' if news_lbl else "")
+            + f'</div>'
+        )
 
     warn = str(row.get("警告",""))
     warn_html = (
@@ -1544,6 +1926,7 @@ def render_card(row: dict | pd.Series) -> str:
       <div style="margin-top:7px;font-size:0.70rem;color:#6a9ab0;line-height:1.7;">
         {reason_html}
       </div>
+      {chip_html}
       {zones_html}
       <hr style="border:none;border-top:1px solid #0e2030;margin:9px 0 7px;">
       <div style="font-family:'IBM Plex Mono',monospace;font-size:0.78rem;color:#8aabb8;">
@@ -1881,7 +2264,8 @@ def main():
                     unsafe_allow_html=True)
 
         disp_cols = ["代號","名稱","產業","模式","收盤價","漲跌%","信號",
-                     "評分","評級","G分","P分","S分","F分","回測報酬%","勝率%","MDD%"]
+                     "評分","評級","G分","P分","S分","F分","C分",
+                     "外資5日","投信5日","新聞情緒","回測報酬%","勝率%","MDD%"]
         disp = view[[c for c in disp_cols if c in view.columns]].copy()
 
         def _cn(v): return "color:#00c87a" if isinstance(v,(int,float)) and v>0 else ("color:#ff5c5c" if isinstance(v,(int,float)) and v<0 else "")
