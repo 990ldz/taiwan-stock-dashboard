@@ -1691,7 +1691,7 @@ def main():
         if min_foreign: view = view[view["外資連買日"] >= min_foreign]
 
         # Top 5 置頂卡片
-        mode_lbl = {"short":"⚡短線","mid":"📊中線","long":"🔭長線"}[mode]
+        mode_lbl = {"daytrade":"⚡當沖準備","swing":"📊波段操作","value":"🏦中長線存股"}.get(mode, mode)
         st.markdown(
             f'<div class="sec-title">今日最佳標的 Top 5 &nbsp;'
             f'<span style="font-size:0.72rem;color:#3a6a8a;">{mode_lbl} · 依外資買超排序</span></div>',
