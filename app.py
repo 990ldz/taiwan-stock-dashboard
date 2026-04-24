@@ -311,7 +311,8 @@ def fetch_margin(sid: str, token: str = "") -> pd.DataFrame:
 
 @st.cache_data(ttl=7200, show_spinner=False)
 def fetch_taiex(start: str, end: str, token: str = "") -> pd.DataFrame:
-    for did in ["TAIEX","Y9999",""]:
+    # 方法一：標準大盤指數 API
+    for did in ["TAIEX", "Y9999", ""]:
         params = {"dataset":"TaiwanStockMarketIndex","start_date":start,"end_date":end}
         if did: params["data_id"] = did
         if token: params["token"] = token
@@ -330,11 +331,189 @@ def fetch_taiex(start: str, end: str, token: str = "") -> pd.DataFrame:
             df["Volume"] = df["Open"] = df["High"] = df["Low"] = df["Close"]
             return df
         except Exception: continue
+
+    # 方法二：用 0050 當大盤代理（免費 Token 也能取）
+    try:
+        params = {"dataset":"TaiwanStockPrice","data_id":"0050",
+                  "start_date":start,"end_date":end}
+        if token: params["token"] = token
+        r = requests.get(FINMIND_API, params=params, timeout=20)
+        d = r.json()
+        if d.get("status") == 200 and d.get("data"):
+            df = pd.DataFrame(d["data"])
+            df = df.rename(columns={"close":"Close","open":"Open",
+                                     "max":"High","min":"Low","Trading_Volume":"Volume"})
+            df["date"]  = pd.to_datetime(df["date"])
+            df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+            df = df.sort_values("date").dropna(subset=["Close"]).reset_index(drop=True)
+            if len(df) >= 10:
+                df.attrs["is_proxy"] = True   # 標記為代理
+                return df
+    except Exception: pass
+
     return pd.DataFrame()
 
 
-@st.cache_data(ttl=7200, show_spinner=False)
-def fetch_news_sentiment(sid: str, name: str, token: str = "") -> dict:
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_monthly_revenue(sid: str, token: str = "") -> pd.DataFrame:
+    """月營收 YoY 資料"""
+    end   = datetime.today().strftime("%Y-%m-%d")
+    start = (datetime.today() - timedelta(days=450)).strftime("%Y-%m-%d")
+    params = {"dataset":"TaiwanStockMonthRevenue","data_id":sid,
+              "start_date":start,"end_date":end}
+    if token: params["token"] = token
+    try:
+        r = requests.get(FINMIND_API, params=params, timeout=15)
+        d = r.json()
+        if d.get("status") != 200 or not d.get("data"): return pd.DataFrame()
+        df = pd.DataFrame(d["data"])
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date").reset_index(drop=True)
+        for col in ["revenue","Revenue","revenue_month"]:
+            if col in df.columns:
+                df["revenue"] = pd.to_numeric(df[col], errors="coerce"); break
+        return df.dropna(subset=["revenue"])
+    except Exception: return pd.DataFrame()
+
+
+# ── 長線/存股 特殊評分：基本面 + 殖利率 ───────────────────────────
+
+# 已知高殖利率/護城河股票（2024 年統計）
+DIVIDEND_STOCKS = {
+    "2881": {"div_yield": 5.5, "type": "金融"},
+    "2882": {"div_yield": 5.2, "type": "金融"},
+    "2886": {"div_yield": 5.0, "type": "金融"},
+    "2891": {"div_yield": 4.8, "type": "金融"},
+    "2892": {"div_yield": 5.1, "type": "金融"},
+    "5880": {"div_yield": 5.3, "type": "金融"},
+    "2884": {"div_yield": 4.6, "type": "金融"},
+    "2885": {"div_yield": 4.2, "type": "金融"},
+    "2887": {"div_yield": 4.5, "type": "金融"},
+    "2412": {"div_yield": 5.5, "type": "電信"},
+    "3045": {"div_yield": 4.8, "type": "電信"},
+    "4904": {"div_yield": 4.5, "type": "電信"},
+    "2912": {"div_yield": 4.2, "type": "零售"},
+    "5903": {"div_yield": 3.8, "type": "零售"},
+    "1101": {"div_yield": 4.0, "type": "水泥"},
+    "1102": {"div_yield": 3.8, "type": "水泥"},
+    "2330": {"div_yield": 2.5, "type": "半導體"},
+    "6505": {"div_yield": 6.0, "type": "石化"},
+}
+
+def score_value(inst_df, price_df, rev_df, news, sid) -> dict:
+    """
+    長線/存股模式評分（100分制）
+    F 基本面品質    45分
+    G 法人長期持有  30分
+    T 技術趨勢     25分
+    """
+    bd = []; raw = 0.0
+
+    # ── F 基本面（45分）────────────────────────────────────
+    # F1：月營收 YoY > 15% (+20)
+    yoy = 0.0
+    if rev_df is not None and len(rev_df) >= 14:
+        try:
+            latest   = float(rev_df.iloc[-1]["revenue"])
+            year_ago = float(rev_df.iloc[-13]["revenue"])
+            yoy = (latest - year_ago) / year_ago * 100 if year_ago > 0 else 0
+        except Exception: pass
+    if yoy > 20:    f1, f1l = 20, f"月營收 YoY {yoy:+.1f}%（高速成長）"
+    elif yoy > 15:  f1, f1l = 15, f"月營收 YoY {yoy:+.1f}%（穩健成長）"
+    elif yoy > 0:   f1, f1l = 8,  f"月營收 YoY {yoy:+.1f}%（微幅成長）"
+    elif yoy > -10: f1, f1l = 0,  f"月營收 YoY {yoy:+.1f}%（持平）"
+    else:           f1, f1l = -10,f"月營收 YoY {yoy:+.1f}%（衰退）"
+    raw += f1
+    bd.append({"stage":"F","label":f1l,"pts":f1,"met":f1>0,
+               "detail":"近12月同比成長"})
+
+    # F2：殖利率 / 護城河 (+25)
+    div_info = DIVIDEND_STOCKS.get(sid, {})
+    dy = div_info.get("div_yield", 0)
+    if dy >= 5.0:   f2, f2l = 25, f"高殖利率 {dy:.1f}%（存股首選）"
+    elif dy >= 4.0: f2, f2l = 18, f"殖利率 {dy:.1f}%（穩定配息）"
+    elif dy >= 3.0: f2, f2l = 10, f"殖利率 {dy:.1f}%（尚可）"
+    elif sid in {"2330","2454","6415","3529"}:
+        f2, f2l = 15, "半導體龍頭（成長護城河）"
+    else: f2, f2l = 0, "護城河資料不足"
+    raw += f2
+    bd.append({"stage":"F","label":f2l,"pts":f2,"met":f2>0,"detail":""})
+
+    # ── G 法人長期（30分）────────────────────────────────
+    f_30d = 0.0; t_30d = 0.0
+    if not inst_df.empty and len(inst_df) >= 5:
+        if "外資" in inst_df.columns:
+            f_30d = float(inst_df["外資"].fillna(0).sum())
+        if "投信" in inst_df.columns:
+            t_30d = float(inst_df["投信"].fillna(0).sum())
+
+        if f_30d > 5e8:   g1, g1l = 20, f"外資月累計大量買超 {f_30d/1e8:.1f}億"
+        elif f_30d > 1e8: g1, g1l = 12, f"外資月累計買超 {f_30d/1e8:.1f}億"
+        elif f_30d > 0:   g1, g1l = 5,  f"外資月累計小量買進"
+        else:             g1, g1l = -5, f"外資月累計賣超 {abs(f_30d)/1e8:.1f}億"
+        raw += g1
+        bd.append({"stage":"G","label":g1l,"pts":g1,"met":g1>0,"detail":""})
+
+        if t_30d > 5e7:   g2, g2l = 10, f"投信月累計積極買超 {t_30d/1e6:.0f}萬"
+        elif t_30d > 0:   g2, g2l = 5,  f"投信月累計輕量買進"
+        else:             g2, g2l = 0,  "投信月累計賣出"
+        raw += g2
+        bd.append({"stage":"G","label":g2l,"pts":g2,"met":g2>0,"detail":""})
+
+    # ── T 技術趨勢（25分）───────────────────────────────
+    if not price_df.empty and len(price_df) >= 20:
+        df2 = compute_indicators(price_df)
+        last = df2.iloc[-1]
+        def _v2(c): v=last.get(c); return float(v) if v is not None and not pd.isna(v) else np.nan
+        ma20=_v2("MA20"); ma60=_v2("MA60"); rsi=_v2("RSI"); close=float(last["Close"])
+
+        t1 = not np.isnan(ma60) and close > ma60
+        raw += 15 if t1 else 0
+        bd.append({"stage":"T","label":"站上季線MA60（長線趨勢向上）",
+                   "pts":15,"met":t1,"detail":f"MA60={ma60:.1f}" if not np.isnan(ma60) else "N/A"})
+
+        t2 = not np.isnan(ma20) and close > ma20
+        raw += 10 if t2 else 0
+        bd.append({"stage":"T","label":"站上月線MA20（中線多頭）",
+                   "pts":10,"met":t2,"detail":f"MA20={ma20:.1f}" if not np.isnan(ma20) else "N/A"})
+
+    # 新聞加分
+    if news and news.get("count", 0) > 0:
+        np_s = round(float(news.get("score",0)) * 10)
+        raw += np_s
+        bd.append({"stage":"N","label":f"新聞情緒 {news.get('label','')} ({np_s:+d}分)",
+                   "pts":np_s,"met":np_s>0,"detail":news.get("summary","")})
+
+    final = float(max(0, min(100, raw)))
+    if final >= 75:   grade,lbl,act,gc="AAA","優質存股","長線核心持倉，定期定額","#00c87a"
+    elif final >= 60: grade,lbl,act,gc="AA","成長+配息","建議分批買進","#80d840"
+    elif final >= 45: grade,lbl,act,gc="A","觀察追蹤","等回測月線再進場","#f0c040"
+    else:             grade,lbl,act,gc="B","暫緩觀望","基本面或法人不理想","#f0a500"
+
+    pos=[b["label"] for b in bd if b["met"] and b["pts"]>0]
+    neg=[b["label"] for b in bd if b["met"] and b["pts"]<0]
+    parts=[]
+    if pos: parts.append("✅ "+" ｜ ".join(pos))
+    if neg: parts.append("🔴 "+" ｜ ".join(neg))
+
+    # 計算 foreign_5d etc. for card compatibility
+    f5d = float(inst_df["外資"].tail(5).fillna(0).sum()) if not inst_df.empty and "外資" in inst_df.columns else 0
+    t5d = float(inst_df["投信"].tail(5).fillna(0).sum()) if not inst_df.empty and "投信" in inst_df.columns else 0
+    fs  = sum(1 for v in (inst_df["外資"].tail(5).fillna(0).tolist() if not inst_df.empty and "外資" in inst_df.columns else []) if v > 0)
+
+    return {
+        "signal": final >= 60, "score": final,
+        "grade": grade, "grade_label": lbl, "grade_action": act, "grade_color": gc,
+        "reason": "  ".join(parts) if parts else "⬜ 無明確信號",
+        "breakdown": bd, "yoy": yoy, "div_yield": dy,
+        "foreign_5d": f5d, "trust_5d": t5d, "dealer_5d": 0,
+        "foreign_streak": fs, "trust_streak": 0,
+        "score_G": sum(b["pts"] for b in bd if b["stage"]=="G" and b["met"] and b["pts"]>0),
+        "score_T": sum(b["pts"] for b in bd if b["stage"]=="T" and b["met"] and b["pts"]>0),
+        "score_N": sum(b["pts"] for b in bd if b["stage"]=="N" and b["met"] and b["pts"]>0),
+    }
+
+
     """新聞情緒分析"""
     end   = datetime.today().strftime("%Y-%m-%d")
     start = (datetime.today() - timedelta(days=14)).strftime("%Y-%m-%d")
@@ -784,7 +963,119 @@ def compute_zones(price_df: pd.DataFrame, mode: str = "mid") -> dict:
 # ════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def run_institutional_scan(token: str, mode: str, max_stocks: int) -> pd.DataFrame:
+def run_institutional_scan(token: str, mode: str, max_stocks: int,
+                           sector_filter: str = "全部產業") -> pd.DataFrame:
+    universe = get_universe()
+
+    # 套用產業篩選
+    if sector_filter != "全部產業":
+        universe = [s for s in universe if SECTOR_MAP.get(s,"其他") == sector_filter]
+
+    universe = universe[:max_stocks]
+    if not universe:
+        return pd.DataFrame()
+
+    end   = datetime.today().strftime("%Y-%m-%d")
+    start = (datetime.today() - timedelta(days=120)).strftime("%Y-%m-%d")
+
+    # 長線需要更多歷史資料
+    if mode == "value":
+        start = (datetime.today() - timedelta(days=180)).strftime("%Y-%m-%d")
+
+    prog = st.progress(0.0)
+    stat = st.empty()
+    rows = []
+
+    mode_label = {"daytrade":"當沖準備","swing":"波段操作","value":"中長線存股"}[mode]
+
+    for i, sid in enumerate(universe):
+        name = STOCK_NAMES.get(sid, sid)
+        stat.markdown(
+            f"<span style='color:#3a8aaa;font-size:0.8rem;'>"
+            f"🏦 [{mode_label}] 分析 {sid} {name}（{i+1}/{len(universe)}）</span>",
+            unsafe_allow_html=True
+        )
+        prog.progress((i+1)/len(universe))
+
+        price_df  = fetch_price(sid, start, end, token)
+        inst_df   = fetch_institutional(sid, token)
+        margin_df = fetch_margin(sid, token)
+        news      = fetch_news_sentiment(sid, name, token)
+
+        if price_df.empty or len(price_df) < 5:
+            time.sleep(0.2); continue
+
+        # 依模式選擇評分函式
+        if mode == "value":
+            rev_df = fetch_monthly_revenue(sid, token)
+            sc = score_value(inst_df, price_df, rev_df, news, sid)
+            min_score = 40
+        else:
+            sc = score_institutional_first(inst_df, price_df, margin_df, news, sid)
+            min_score = 35 if mode == "daytrade" else 35
+
+        if sc["score"] < min_score:
+            time.sleep(0.2); continue
+
+        zones = compute_zones(price_df, {"daytrade":"short","swing":"swing","value":"long"}[mode])
+        last  = price_df.iloc[-1]
+        prev  = price_df.iloc[-2] if len(price_df) >= 2 else last
+        chg   = (float(last["Close"])-float(prev["Close"]))/float(prev["Close"])*100
+
+        # 計算昨日量能比（當沖模式額外重視）
+        vol_today = float(last.get("Volume",0)) if "Volume" in last.index else 0
+        vol_5d_avg= float(price_df["Volume"].tail(6).iloc[:-1].mean()) if len(price_df)>=6 else 0
+        vol_ratio  = round(vol_today/vol_5d_avg, 2) if vol_5d_avg > 0 else 0
+
+        rows.append({
+            "代號":      sid,
+            "名稱":      name,
+            "產業":      SECTOR_MAP.get(sid,"其他"),
+            "策略":      mode_label,
+            "收盤價":    round(float(last["Close"]),1),
+            "漲跌%":     round(chg,2),
+            "評分":      round(sc["score"],0),
+            "評級":      sc["grade"],
+            "行動":      sc["grade_action"],
+            "評級色":    sc["grade_color"],
+            "信號":      "✅ 買進" if sc["signal"] else "⬜ 觀察",
+            "G法人":     sc["score_G"],
+            "T技術":     sc["score_T"],
+            "N新聞":     sc["score_N"],
+            "外資5日億": round(sc["foreign_5d"]/1e8, 2),
+            "外資連買日":sc["foreign_streak"],
+            "投信5日萬": round(sc["trust_5d"]/1e4, 0),
+            "投信連買日":sc["trust_streak"],
+            "量比":      vol_ratio,
+            "新聞情緒":  news.get("label","—"),
+            "新聞色":    news.get("color","#5a8fa8"),
+            "殖利率%":   sc.get("div_yield", 0) if mode=="value" else 0,
+            "YoY%":      sc.get("yoy", 0)       if mode=="value" else 0,
+            "進場價":    zones.get("entry_a",0),
+            "停損價":    zones.get("stop",0),
+            "目標一":    zones.get("t1",0),
+            "目標二":    zones.get("t2",0),
+            "風報比":    zones.get("rr",0),
+            "原因":      sc["reason"],
+            "_sc":       sc,
+            "_zones":    zones,
+            "_price_df": price_df,
+        })
+        time.sleep(0.3)
+
+    prog.empty(); stat.empty()
+    if not rows: return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    # 排序：當沖按量比，波段按外資連買，長線按殖利率+評分
+    if mode == "daytrade":
+        df = df.sort_values(["量比","評分"], ascending=[False,False])
+    elif mode == "value":
+        df = df.sort_values(["殖利率%","評分"], ascending=[False,False])
+    else:
+        df = df.sort_values(["外資連買日","評分"], ascending=[False,False])
+
+    return df.reset_index(drop=True)
     universe = get_universe()[:max_stocks]
     end   = datetime.today().strftime("%Y-%m-%d")
     start = (datetime.today() - timedelta(days=120)).strftime("%Y-%m-%d")
@@ -1116,19 +1407,72 @@ def main():
                               placeholder="有Token速度更快、資料更完整")
 
         st.divider()
-        st.markdown("**🎯 投資週期**")
-        mode = st.radio("選擇模式",
-            options=["short","mid","long"],
-            format_func=lambda x: {"short":"⚡ 短線（7日）",
-                                   "mid":"📊 中線（6-12月）",
-                                   "long":"🔭 長線（1年+）"}[x],
+        st.markdown("**🎯 選股策略模式**")
+        mode = st.radio("我的目標是",
+            options=["daytrade","swing","value"],
+            format_func=lambda x: {
+                "daytrade": "⚡ 當沖準備（盤前選標的）",
+                "swing":    "📊 波段操作（7-30日）",
+                "value":    "🏦 中長線存股（配息+成長）",
+            }[x],
             index=1)
+
+        # 各模式說明
+        mode_tips = {
+            "daytrade": (
+                "**當沖準備邏輯**\n"
+                "- 找昨日量能異常、有催化劑的股票\n"
+                "- 開盤後看 VWAP 突破再進場\n"
+                "- ⚠️ 本系統提供盤前準備，不能取代即時盤口判斷\n"
+                "- 建議搭配「盤前VWAP」Tab 使用"
+            ),
+            "swing": (
+                "**波段操作邏輯（最推薦）**\n"
+                "- 外資連買 3日+ 為核心訊號\n"
+                "- 技術面確認（突破均線+量能）\n"
+                "- 族群輪動加分\n"
+                "- 持有 7-30 天，等強勢結束再出場"
+            ),
+            "value": (
+                "**中長線存股邏輯**\n"
+                "- 月營收年增率 > 15%（成長股）\n"
+                "- 金融股/電信股殖利率 > 4%（存股）\n"
+                "- 法人長期持有（3個月累積）\n"
+                "- 適合分批買進，持有 3個月-1年以上"
+            ),
+        }
+        st.info(mode_tips[mode])
+
+        st.divider()
+        st.markdown("**🏭 產業篩選**")
+
+        # 整理所有產業（從 SECTOR_MAP 取）
+        all_sectors = sorted(set(SECTOR_MAP.values()))
+        all_sectors = ["全部產業"] + all_sectors
+
+        sel_sector = st.selectbox(
+            "選擇聚焦產業",
+            options=all_sectors,
+            index=0,
+            help="選擇特定產業可縮短掃描時間，並聚焦在你熟悉的領域"
+        )
 
         st.divider()
         st.markdown("**📡 掃描設定**")
-        max_stocks = st.slider("掃描股票數量", 20, len(get_universe()),
-                               40, 10, help="數量越多越完整，但需更多時間")
-        st.caption(f"股票宇宙：{len(get_universe())} 檔（0050+0051+法人重倉）")
+
+        # 根據模式設定預設掃描數量
+        default_max = {"daytrade": 30, "swing": 40, "value": 60}[mode]
+        max_stocks = st.slider(
+            "掃描股票數量", 20, len(get_universe()), default_max, 10,
+            help="數量越多越完整，但需更多時間"
+        )
+
+        universe_size = len(get_universe())
+        if sel_sector != "全部產業":
+            filtered_size = sum(1 for s in get_universe() if SECTOR_MAP.get(s,"其他") == sel_sector)
+            st.caption(f"篩選後：{filtered_size} 檔 / 宇宙共 {universe_size} 檔")
+        else:
+            st.caption(f"股票宇宙：{universe_size} 檔（0050 + 0051 + 法人重倉）")
 
         col1, col2 = st.columns(2)
         run_btn = col1.button("🔍 開始掃描", type="primary", use_container_width=True)
@@ -1139,20 +1483,20 @@ def main():
             st.success("已清除")
 
         st.divider()
-        st.markdown("""
-<div style="font-size:0.72rem;color:#3a5a70;line-height:1.8;">
-<b style="color:#4a8aaa;">選股邏輯（法人優先）</b><br>
-G 外資連買    +0~35分<br>
-G 投信買超    +0~15分<br>
-G 三方共識    +5分<br>
-T 技術確認    +0~30分<br>
-N 新聞情緒   ±15分<br>
-<br>
-<b style="color:#ff7878;">死亡過濾</b><br>
-外資大量賣超  -15分<br>
-融資暴增      -12分<br>
-RSI過熱       -8分
-</div>""", unsafe_allow_html=True)
+        # 評分權重說明（依模式）
+        weight_info = {
+            "daytrade": "G 昨日量能異常  +35\nG 法人當日動向  +25\nT 技術位置(VWAP) +25\nN 新聞催化劑     +15",
+            "swing":    "G 外資連買天數  +35\nG 投信同向買超  +20\nT 技術突破確認  +30\nN 新聞情緒       +15",
+            "value":    "F 營收年增率    +25\nF 殖利率/護城河 +20\nG 法人長期持有  +30\nT 均線多頭排列   +25",
+        }
+        st.markdown(
+            f'<div style="font-size:0.7rem;color:#3a5a70;line-height:1.8;'
+            f'background:#060f1c;border:1px solid #1a3050;border-radius:8px;padding:10px;">'
+            f'<b style="color:#4a8aaa;">本模式評分邏輯</b><br>'
+            + weight_info[mode].replace("\n","<br>") + "</div>",
+            unsafe_allow_html=True
+        )
+        st.divider()
         st.caption("⚠️ 僅供研究，不構成投資建議")
 
     # ── Header ───────────────────────────────────────────────
@@ -1177,15 +1521,17 @@ RSI過熱       -8分
         m60 = float(last_t["MA60"]) if not pd.isna(last_t.get("MA60")) else None
         bull = m60 is not None and cl > m60
         barcls = "ok-bar" if bull else "warn-bar"
-        m20s = f"{m20:,.1f}" if m20 else "N/A"
-        m60s = f"{m60:,.1f}" if m60 else "N/A"
+        m20s = f"{m20:,.2f}" if m20 else "N/A"
+        m60s = f"{m60:,.2f}" if m60 else "N/A"
         date_s = last_t["date"].strftime("%Y-%m-%d")
+        is_proxy = tdf.attrs.get("is_proxy", False)
+        proxy_note = "（以 0050 代理大盤）" if is_proxy else ""
         st.markdown(
             f'<div class="{barcls}">'
-            f'大盤 {date_s}：<b>{cl:,.1f}</b>'
-            f'&nbsp;｜&nbsp;20MA {m20s} &nbsp; 60MA {m60s}'
+            f'大盤參考 {date_s}{proxy_note}：<b>{cl:,.2f}</b>'
+            f'&nbsp;｜&nbsp; 20MA {m20s} &nbsp; 60MA {m60s}'
             f'&nbsp;｜&nbsp;<b>{"多頭格局 ✅" if bull else "空頭警示 ⚠️"}</b>'
-            f'{"&nbsp;｜&nbsp;建議持倉100%" if bull else "&nbsp;｜&nbsp;建議倉位降至30%"}'
+            f'{"&nbsp;｜&nbsp;建議持倉 100%" if bull else "&nbsp;｜&nbsp;建議倉位降至 30%"}'
             f'</div>',
             unsafe_allow_html=True
         )
@@ -1209,7 +1555,10 @@ RSI過熱       -8分
 
         if run_btn:
             with st.spinner("掃描法人動向中，請稍候…"):
-                st.session_state["scan_df"] = run_institutional_scan(token, mode, max_stocks)
+                st.session_state["scan_df"]   = run_institutional_scan(
+                    token, mode, max_stocks, sel_sector
+                )
+                st.session_state["scan_mode"] = mode
 
         scan_df = st.session_state.get("scan_df")
 
@@ -1273,13 +1622,27 @@ RSI過熱       -8分
                 for i, (_, row) in enumerate(chunk.iterrows()):
                     cols[i].markdown(render_inst_card(row), unsafe_allow_html=True)
 
-        # 完整表格
-        st.markdown(f'<div class="sec-title">完整排行（{len(view)} 筆）</div>',
+        scan_mode_used = st.session_state.get("scan_mode", mode)
+        mode_labels = {"daytrade":"當沖準備","swing":"波段操作","value":"中長線存股"}
+        mode_lbl2 = mode_labels.get(scan_mode_used, "")
+
+        # 完整排行榜
+        st.markdown(f'<div class="sec-title">完整排行（{len(view)} 筆）· {mode_lbl2}</div>',
                     unsafe_allow_html=True)
 
-        dcols = ["代號","名稱","產業","收盤價","漲跌%","評分","評級",
-                 "外資5日億","外資連買日","投信5日萬","投信連買日",
-                 "新聞情緒","G法人","T技術","N新聞","進場價","停損價","目標一","風報比"]
+        # 依模式顯示不同欄位
+        if scan_mode_used == "value":
+            dcols = ["代號","名稱","產業","收盤價","漲跌%","評分","評級",
+                     "殖利率%","YoY%","外資5日億","外資連買日","投信5日萬",
+                     "新聞情緒","G法人","T技術","進場價","停損價","目標一"]
+        elif scan_mode_used == "daytrade":
+            dcols = ["代號","名稱","產業","收盤價","漲跌%","評分","評級",
+                     "量比","外資5日億","新聞情緒","G法人","T技術","N新聞",
+                     "進場價","停損價","目標一","風報比"]
+        else:
+            dcols = ["代號","名稱","產業","收盤價","漲跌%","評分","評級",
+                     "外資5日億","外資連買日","投信5日萬","投信連買日",
+                     "新聞情緒","G法人","T技術","N新聞","進場價","停損價","目標一","風報比"]
         disp = view[[c for c in dcols if c in view.columns]].copy()
 
         def _cn(v): return "color:#00c87a" if isinstance(v,(int,float)) and v>0 else ("color:#ff5c5c" if isinstance(v,(int,float)) and v<0 else "")
