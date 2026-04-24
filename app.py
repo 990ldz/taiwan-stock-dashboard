@@ -356,7 +356,11 @@ def fetch_taiex(start: str, end: str, token: str = "") -> pd.DataFrame:
 
 @st.cache_data(ttl=7200, show_spinner=False)
 def fetch_news_sentiment(sid: str, name: str, token: str = "") -> dict:
-    """新聞情緒分析（FinMind 新聞 + Claude API）"""
+    """
+    新聞情緒分析。
+    先嘗試 FinMind 新聞，用關鍵字快速分類（不依賴外部 API Key）。
+    若標題數量足夠，再嘗試 Claude API（需部署環境有 API Key）。
+    """
     end   = datetime.today().strftime("%Y-%m-%d")
     start = (datetime.today() - timedelta(days=14)).strftime("%Y-%m-%d")
     headlines = []
@@ -364,45 +368,73 @@ def fetch_news_sentiment(sid: str, name: str, token: str = "") -> dict:
         params = {"dataset":"TaiwanStockNews","data_id":sid,
                   "start_date":start,"end_date":end}
         if token: params["token"] = token
-        r = requests.get(FINMIND_API, params=params, timeout=15)
+        r = requests.get(FINMIND_API, params=params, timeout=10)
         d = r.json()
         if d.get("status") == 200 and d.get("data"):
-            df = pd.DataFrame(d["data"])
-            if "title" in df.columns:
-                headlines = df["title"].dropna().tolist()[-10:]
-    except Exception: pass
+            df_news = pd.DataFrame(d["data"])
+            if "title" in df_news.columns:
+                headlines = df_news["title"].dropna().tolist()[-10:]
+    except Exception:
+        pass
 
     if not headlines:
-        return {"score":0.0,"label":"無資料","color":"#5a8fa8",
-                "summary":"","headlines":[],"count":0}
+        return {"score": 0.0, "label": "無新聞", "color": "#5a8fa8",
+                "summary": "", "headlines": [], "count": 0}
 
-    prompt = f"""以下是台股 {sid} {name} 近期新聞：
-{chr(10).join(['- '+h for h in headlines])}
+    # ── 關鍵字快速分類（不需要 API Key）──────────────────────
+    pos_kw = ["創高","突破","法說","營收成長","獲利","配息","EPS",
+               "買超","增持","升評","目標價調升","訂單","新客戶",
+               "看好","強勁","超預期","利多","入選","漲停"]
+    neg_kw = ["衰退","下修","虧損","賣超","降評","裁員","罰款",
+               "調降","利空","減資","停損","風險","警示","跌停",
+               "庫存","下滑","衝擊"]
 
-只回傳 JSON，不加說明：
-{{"score": 0.6, "label": "偏多", "summary": "30字以內摘要"}}
+    pos_count = sum(1 for h in headlines for k in pos_kw if k in h)
+    neg_count = sum(1 for h in headlines for k in neg_kw if k in h)
+    total = len(headlines)
 
-score: 0.8-1.0強多 / 0.4-0.8偏多 / -0.4-0.4中性 / -0.8--0.4偏空 / -1.0--0.8強空"""
+    if pos_count > neg_count * 1.5:
+        score = min(0.3 + pos_count / total * 0.5, 0.8)
+        label = "偏多" if score < 0.7 else "強多"
+        color = "#00c87a"
+    elif neg_count > pos_count * 1.5:
+        score = max(-0.3 - neg_count / total * 0.5, -0.8)
+        label = "偏空" if score > -0.7 else "強空"
+        color = "#ff5c5c"
+    else:
+        score = 0.0
+        label = "中性"
+        color = "#f0c040"
 
+    # 嘗試 Claude API（若部署環境有 Key 則加強分析）
     try:
+        news_text = "\n".join([f"- {h}" for h in headlines[:6]])
+        prompt = (f"台股{sid}{name}新聞：\n{news_text}\n\n"
+                  f"只回傳JSON，不加說明：{{\"score\":0.6,\"label\":\"偏多\",\"summary\":\"20字摘要\"}}\n"
+                  f"score範圍 -1到1，正=利多，負=利空")
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers={"Content-Type":"application/json"},
-            json={"model":"claude-sonnet-4-20250514","max_tokens":200,
+            headers={"Content-Type": "application/json"},
+            json={"model":"claude-sonnet-4-20250514","max_tokens":150,
                   "messages":[{"role":"user","content":prompt}]},
-            timeout=20
+            timeout=8
         )
-        text = resp.json()["content"][0]["text"]
-        text = text.replace("```json","").replace("```","").strip()
-        p = json.loads(text)
-        sc = float(p.get("score",0))
-        lbl= p.get("label","中性")
-        clr = ("#00c87a" if sc>0.4 else "#f0c040" if sc>-0.4 else "#ff5c5c")
-        return {"score":sc,"label":lbl,"color":clr,
-                "summary":p.get("summary",""),"headlines":headlines,"count":len(headlines)}
+        if resp.status_code == 200:
+            text = resp.json()["content"][0]["text"]
+            text = text.replace("```json","").replace("```","").strip()
+            p    = json.loads(text)
+            sc2  = float(p.get("score", score))
+            lbl2 = p.get("label", label)
+            clr2 = "#00c87a" if sc2 > 0.3 else "#f0c040" if sc2 > -0.3 else "#ff5c5c"
+            return {"score": sc2, "label": lbl2, "color": clr2,
+                    "summary": p.get("summary",""), "headlines": headlines,
+                    "count": len(headlines)}
     except Exception:
-        return {"score":0.0,"label":"分析失敗","color":"#5a8fa8",
-                "summary":"","headlines":headlines,"count":len(headlines)}
+        pass  # Claude API 不可用時沿用關鍵字結果
+
+    return {"score": score, "label": label, "color": color,
+            "summary": f"共 {len(headlines)} 則新聞，正面{pos_count}則，負面{neg_count}則",
+            "headlines": headlines, "count": len(headlines)}
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -1060,15 +1092,19 @@ def run_institutional_scan(token: str, mode: str, max_stocks: int,
         if mode == "value":
             rev_df = fetch_monthly_revenue(sid, token)
             sc = score_value(inst_df, price_df, rev_df, news, sid)
-            min_score = 40
+            # 長線門檻：基本面 + 技術即可
+            min_score = 35
         else:
             sc = score_institutional_first(inst_df, price_df, margin_df, news, sid)
-            min_score = 35 if mode == "daytrade" else 35
+            # 動態門檻：有法人資料用 40，沒有用 20（技術面備援）
+            inst_available = not inst_df.empty and len(inst_df) >= 3
+            min_score = 40 if inst_available else 20
 
         if sc["score"] < min_score:
             time.sleep(0.2); continue
 
-        zones = compute_zones(price_df, {"daytrade":"short","swing":"swing","value":"long"}[mode])
+        zone_mode = {"daytrade":"short","swing":"mid","value":"long"}[mode]
+        zones = compute_zones(price_df, zone_mode)
         last  = price_df.iloc[-1]
         prev  = price_df.iloc[-2] if len(price_df) >= 2 else last
         chg   = (float(last["Close"])-float(prev["Close"]))/float(prev["Close"])*100
@@ -1628,10 +1664,13 @@ def main():
 
         if scan_df.empty:
             st.markdown(
-                '<div class="warn-bar">掃描結果為空。可能原因：<br>'
-                '① FinMind 法人資料需要 Token（請在左側填入）<br>'
-                '② 今日法人整體賣超，市場偏弱<br>'
-                '③ 請點「清快取」後重新掃描</div>',
+                '<div class="warn-bar">'
+                '<b>掃描結果為空，可能原因：</b><br>'
+                '① 今日法人整體賣超，技術面也偏弱（正常現象，可改選「全部產業」重掃）<br>'
+                '② FinMind API 速率限制（請等 30 秒後點「清快取」再掃）<br>'
+                '③ 請試著把「掃描股票數量」調低到 20 檔，排除速率問題<br>'
+                '④ 確認 Token 已正確填入（法人資料需要 Token）'
+                '</div>',
                 unsafe_allow_html=True
             )
             return
